@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/marsala"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+rust-version = "1.82"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "=4.5.57", features = ["derive", "env"] }
+config = { version = "=0.15.11", default-features = false, features = ["toml"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

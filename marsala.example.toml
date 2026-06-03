@@ -1,0 +1,10 @@
+[server]
+host = "127.0.0.1"
+port = 8787
+
+[logging]
+enabled = true
+path = "logs/events.jsonl"
+log_bodies = true
+redact_secrets = true
+capture_stream_chunks = true
