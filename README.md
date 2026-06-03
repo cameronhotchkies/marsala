@@ -4,10 +4,10 @@ Phase 0 is a local-first Rust service skeleton for an eventual OpenAI-shaped pro
 
 ## Prerequisites
 
-- Rust 1.82 or newer
+- Rust 1.96 or newer
 - `cargo` from the same toolchain
 
-This repo declares `rust-version = "1.82"` in [Cargo.toml](/home/cameron/code/marsala/Cargo.toml:9) and pins `1.82.0` in [rust-toolchain.toml](/home/cameron/code/marsala/rust-toolchain.toml:1) for `rustup` users.
+This repo declares `rust-version = "1.96"` in `Cargo.toml` and pins `1.96.0` in `rust-toolchain.toml` for `rustup` users. If you manage toolchains manually, use `rustup toolchain install 1.96.0` and `rustup override set 1.96.0` or `rustup default 1.96.0`.
 
 ## Workspace layout
 
