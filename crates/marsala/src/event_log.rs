@@ -185,6 +185,7 @@ struct LogFollower {
 }
 
 impl LogFollower {
+    #[cfg(test)]
     fn new(path: PathBuf, start_at_end_on_first_open: bool) -> Self {
         let initial_open = start_at_end_on_first_open.then_some(InitialOpen::StartAtEnd);
         Self::with_initial_open(path, initial_open)
@@ -219,6 +220,7 @@ impl LogFollower {
                 match self.open_current_path()? {
                     Some((mut reader, file_state)) => {
                         self.cursor = match self.initial_open.take() {
+                            #[cfg(test)]
                             Some(InitialOpen::StartAtEnd) => file_state.len,
                             Some(InitialOpen::ResumeFromSnapshot { file_id, cursor })
                                 if file_state.id == file_id =>
@@ -347,8 +349,12 @@ fn read_tail_snapshot(path: &Path, lines: usize) -> Result<TailSnapshot> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitialOpen {
+    #[cfg(test)]
     StartAtEnd,
-    ResumeFromSnapshot { file_id: FileId, cursor: u64 },
+    ResumeFromSnapshot {
+        file_id: FileId,
+        cursor: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

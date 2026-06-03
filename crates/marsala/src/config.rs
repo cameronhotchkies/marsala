@@ -5,6 +5,8 @@ use config::{Config, Environment, File, FileFormat};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CONFIG_FILE: &str = "marsala.toml";
+const ENV_LIST_SEPARATOR: &str = ",";
+const MITM_ALLOW_HOSTS_ENV_KEY: &str = "mitm.allow_hosts";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -47,7 +49,8 @@ impl AppConfig {
             Environment::with_prefix("MARSALA")
                 .prefix_separator("__")
                 .separator("__")
-                .list_separator(",")
+                .list_separator(ENV_LIST_SEPARATOR)
+                .with_list_parse_key(MITM_ALLOW_HOSTS_ENV_KEY)
                 .try_parsing(true),
         );
 
@@ -198,13 +201,16 @@ impl Default for MitmConfig {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const ENV_PREFIX: &str = "MARSALA__";
+    const CONFIG_SELECTOR_ENV: &str = "MARSALA_CONFIG";
 
     struct CurrentDirGuard {
         original: PathBuf,
@@ -222,6 +228,52 @@ mod tests {
         fn drop(&mut self) {
             env::set_current_dir(&self.original).expect("restore current dir");
         }
+    }
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(OsString, OsString)>,
+    }
+
+    impl EnvGuard {
+        fn isolate_marsala() -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock");
+            let saved: Vec<_> = env::vars_os()
+                .filter(|(key, _)| is_marsala_env_key(key))
+                .collect();
+
+            for (key, _) in &saved {
+                env::remove_var(key);
+            }
+
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            env::set_var(key, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            let current_keys: Vec<_> = env::vars_os()
+                .map(|(key, _)| key)
+                .filter(is_marsala_env_key)
+                .collect();
+
+            for key in current_keys {
+                env::remove_var(key);
+            }
+
+            for (key, value) in &self.saved {
+                env::set_var(key, value);
+            }
+        }
+    }
+
+    fn is_marsala_env_key(key: &OsString) -> bool {
+        let key = key.to_string_lossy();
+        key == CONFIG_SELECTOR_ENV || key.starts_with(ENV_PREFIX)
     }
 
     fn error_chain(error: &anyhow::Error) -> String {
@@ -246,7 +298,7 @@ mod tests {
 
     #[test]
     fn config_loads_from_file_and_env() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let env_guard = EnvGuard::isolate_marsala();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("marsala.toml");
         fs::write(
@@ -266,13 +318,10 @@ capture_stream_chunks = true
         )
         .expect("write config");
 
-        std::env::set_var("MARSALA__SERVER__HOST", "0.0.0.0");
-        std::env::set_var("MARSALA__LOGGING__LOG_BODIES", "false");
+        env_guard.set("MARSALA__SERVER__HOST", "0.0.0.0");
+        env_guard.set("MARSALA__LOGGING__LOG_BODIES", "false");
 
         let config = AppConfig::load(Some(&config_path)).expect("load config");
-
-        std::env::remove_var("MARSALA__SERVER__HOST");
-        std::env::remove_var("MARSALA__LOGGING__LOG_BODIES");
 
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 9999);
@@ -282,18 +331,40 @@ capture_stream_chunks = true
     }
 
     #[test]
+    fn env_string_override_preserves_scalar_server_host() {
+        let env_guard = EnvGuard::isolate_marsala();
+
+        env_guard.set("MARSALA__SERVER__HOST", "0.0.0.0");
+
+        let config = AppConfig::load(None).expect("load config");
+
+        assert_eq!(config.server.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn env_list_override_parses_mitm_allow_hosts() {
+        let env_guard = EnvGuard::isolate_marsala();
+
+        env_guard.set("MARSALA__MITM__ALLOW_HOSTS", "a,b");
+
+        let config = AppConfig::load(None).expect("load config");
+
+        assert_eq!(
+            config.mitm.allow_hosts,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
     fn cli_config_selector_env_does_not_feed_app_config_loader() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let env_guard = EnvGuard::isolate_marsala();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::change_to(tempdir.path());
 
-        env::set_var("MARSALA_CONFIG", "/tmp/cli-only-config.toml");
-        env::set_var("MARSALA__SERVER__PORT", "9797");
+        env_guard.set("MARSALA_CONFIG", "/tmp/cli-only-config.toml");
+        env_guard.set("MARSALA__SERVER__PORT", "9797");
 
         let config = AppConfig::load(None).expect("load config without env collision");
-
-        env::remove_var("MARSALA_CONFIG");
-        env::remove_var("MARSALA__SERVER__PORT");
 
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9797);
@@ -301,6 +372,7 @@ capture_stream_chunks = true
 
     #[test]
     fn config_rejects_unknown_top_level_key() {
+        let _env_guard = EnvGuard::isolate_marsala();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("marsala.toml");
         fs::write(
@@ -321,6 +393,7 @@ unexpected = true
 
     #[test]
     fn config_rejects_unknown_nested_key() {
+        let _env_guard = EnvGuard::isolate_marsala();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("marsala.toml");
         fs::write(
@@ -346,6 +419,7 @@ rotate_daily = true
 
     #[test]
     fn config_rejects_invalid_value_type() {
+        let _env_guard = EnvGuard::isolate_marsala();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("marsala.toml");
         fs::write(
@@ -365,6 +439,7 @@ port = "not-a-port"
 
     #[test]
     fn config_rejects_invalid_shape() {
+        let _env_guard = EnvGuard::isolate_marsala();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("marsala.toml");
         fs::write(
