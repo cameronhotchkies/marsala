@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "marsala",
     version,
-    about = "Phase 0 local-first Rust proxy spine"
+    about = "Phase 1 local-first Rust OpenAI-compatible proxy spine"
 )]
 pub struct Cli {
     #[arg(
@@ -24,7 +24,7 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Default, Subcommand)]
 pub enum Command {
-    #[command(about = "Start the Phase 0 healthz server and event log writer")]
+    #[command(about = "Start the Phase 1 healthz and chat completions server")]
     #[default]
     Serve,
     #[command(about = "Inspect merged configuration")]
@@ -62,7 +62,7 @@ pub struct PrintArgs {
     #[arg(
         long,
         default_value_t = false,
-        help = "Include roadmap config sections that are inactive in Phase 0"
+        help = "Include roadmap config sections that are inactive after Phase 1"
     )]
     pub all: bool,
 }

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod event_log;
 pub mod http;
+pub mod openai;
 
 use std::sync::Once;
 
@@ -30,7 +31,7 @@ pub async fn run() -> Result<()> {
                 let rendered = if args.all {
                     config.to_toml_string()?
                 } else {
-                    config.to_phase_zero_toml_string()?
+                    config.to_active_toml_string()?
                 };
                 println!("{rendered}");
                 Ok(())
@@ -76,7 +77,7 @@ async fn serve_command(config: AppConfig) -> Result<()> {
         }),
     );
 
-    let app = http::build_router(event_log.clone());
+    let app = http::build_router(config.clone(), event_log.clone())?;
     info!(address = %local_addr, "marsala listening");
 
     let shutdown_log = event_log.clone();

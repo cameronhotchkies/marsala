@@ -2,9 +2,13 @@
 host = "127.0.0.1"
 port = 8787
 
+[openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
 [logging]
 enabled = true
 path = "logs/events.jsonl"
-log_bodies = true
+log_bodies = false
 redact_secrets = true
 capture_stream_chunks = true

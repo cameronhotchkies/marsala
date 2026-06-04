@@ -1,6 +1,6 @@
 # Marsala
 
-Phase 0 is a local-first Rust service skeleton for an eventual OpenAI-shaped proxy. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, writes JSONL events, and shuts down on `Ctrl-C`.
+Phase 1 is a local-first Rust service skeleton with a non-streaming OpenAI-shaped chat completions proxy. It starts cleanly, loads config from TOML and env, exposes `GET /healthz` plus `POST /v1/chat/completions`, writes JSONL events, and shuts down on `Ctrl-C`.
 
 ## Prerequisites
 
@@ -36,6 +36,9 @@ Terminal 2:
 ```bash
 cargo run -p marsala -- config print
 curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"Say hi"}]}'
 cargo run -p marsala -- logs tail --lines 20
 ```
 
@@ -43,7 +46,9 @@ Local defaults:
 
 - bind: `127.0.0.1:8787`
 - health check: `http://127.0.0.1:8787/healthz`
+- chat completions: `http://127.0.0.1:8787/v1/chat/completions`
 - JSONL event log: `logs/events.jsonl`
+- body logging: disabled unless `logging.log_bodies=true`
 
 Config loading order:
 
@@ -58,10 +63,18 @@ Example environment overrides:
 
 ```bash
 export MARSALA__SERVER__PORT=9797
-export MARSALA__LOGGING__LOG_BODIES=false
+export MARSALA__LOGGING__LOG_BODIES=true
+export OPENAI_API_KEY=sk-...
 ```
 
-`marsala.example.toml` shows the active Phase 0 config surface. Use `cargo run -p marsala -- config print --all` to inspect the full effective config, including roadmap placeholders that are not active yet.
+`marsala.example.toml` shows the active Phase 1 config surface. Use `cargo run -p marsala -- config print --all` to inspect the full effective config, including roadmap placeholders that are not active yet.
+
+Phase 1 OpenAI upstream settings:
+
+- `openai.base_url`: upstream base, default `https://api.openai.com/v1`
+- `openai.api_key_env`: env var name that holds the upstream API key, default `OPENAI_API_KEY`
+- Marsala does not read inbound `Authorization` as an upstream fallback
+- `stream=true` is rejected locally in Phase 1; omit `stream` or send `false`
 
 ## Docker
 
@@ -72,16 +85,15 @@ docker build -t marsala .
 docker run --rm -p 8787:8787 -v "$(pwd)/logs:/app/logs" marsala
 ```
 
-The container overrides a few settings for safer defaults:
+The container overrides a few runtime settings:
 
 - bind host becomes `0.0.0.0`
-- `logging.log_bodies=false`
 - `logging.capture_stream_chunks=false`
 
-## Phase 0 CLI
+## Phase 1 CLI
 
 - `serve`: start the Axum server
-- `config print`: print the merged active Phase 0 config (`server`, `logging`)
+- `config print`: print the merged active Phase 1 config (`server`, `openai`, `logging`)
 - `config print --all`: include roadmap sections such as `openai`, `rewrite`, `tool_capture`, `proxy`, and `mitm`
 - `logs tail`: print the last JSONL entries, with optional `--follow`
 - `logs tail --follow`: prints one waiting message to stderr when `logs/events.jsonl` does not exist yet, then resumes on file creation or recreation

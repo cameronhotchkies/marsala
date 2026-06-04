@@ -65,18 +65,20 @@ impl AppConfig {
         toml::to_string_pretty(self).context("failed to render configuration")
     }
 
-    pub fn to_phase_zero_toml_string(&self) -> Result<String> {
-        toml::to_string_pretty(&PhaseZeroConfigView {
+    pub fn to_active_toml_string(&self) -> Result<String> {
+        toml::to_string_pretty(&ActiveConfigView {
             server: &self.server,
+            openai: &self.openai,
             logging: &self.logging,
         })
-        .context("failed to render Phase 0 configuration")
+        .context("failed to render active configuration")
     }
 }
 
 #[derive(Debug, Serialize)]
-struct PhaseZeroConfigView<'a> {
+struct ActiveConfigView<'a> {
     server: &'a ServerConfig,
+    openai: &'a OpenAiConfig,
     logging: &'a LoggingConfig,
 }
 
@@ -127,7 +129,7 @@ impl Default for LoggingConfig {
         Self {
             enabled: true,
             path: PathBuf::from("logs/events.jsonl"),
-            log_bodies: true,
+            log_bodies: false,
             redact_secrets: true,
             capture_stream_chunks: true,
         }
@@ -281,13 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn default_config_matches_phase_zero_expectations() {
+    fn default_config_matches_phase_one_expectations() {
         let config = AppConfig::default();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8787);
         assert_eq!(config.openai.base_url, "https://api.openai.com/v1");
         assert!(config.logging.enabled);
-        assert!(config.logging.log_bodies);
+        assert!(!config.logging.log_bodies);
         assert!(config.logging.redact_secrets);
         assert!(config.logging.capture_stream_chunks);
         assert_eq!(config.rewrite.mode, "off");
@@ -457,14 +459,15 @@ server = "127.0.0.1:8787"
     }
 
     #[test]
-    fn phase_zero_render_omits_roadmap_sections() {
+    fn active_render_includes_openai_and_omits_later_phase_sections() {
         let rendered = AppConfig::default()
-            .to_phase_zero_toml_string()
-            .expect("render phase zero config");
+            .to_active_toml_string()
+            .expect("render active config");
 
         assert!(rendered.contains("[server]"));
+        assert!(rendered.contains("[openai]"));
         assert!(rendered.contains("[logging]"));
-        assert!(!rendered.contains("[openai]"));
+        assert!(rendered.contains("log_bodies = false"));
         assert!(!rendered.contains("[rewrite]"));
         assert!(!rendered.contains("[tool_capture]"));
         assert!(!rendered.contains("[proxy]"));

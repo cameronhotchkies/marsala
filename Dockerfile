@@ -15,7 +15,6 @@ COPY --from=builder /app/target/release/marsala /usr/local/bin/marsala
 COPY marsala.example.toml /app/marsala.example.toml
 
 ENV MARSALA__SERVER__HOST=0.0.0.0
-ENV MARSALA__LOGGING__LOG_BODIES=false
 ENV MARSALA__LOGGING__CAPTURE_STREAM_CHUNKS=false
 
 EXPOSE 8787
