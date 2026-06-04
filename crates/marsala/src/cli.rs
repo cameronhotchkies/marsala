@@ -10,7 +10,8 @@ use clap::{Args, Parser, Subcommand};
 )]
 pub struct Cli {
     #[arg(
-        long,
+        long = "config",
+        visible_alias = "config-path",
         global = true,
         env = "MARSALA_CONFIG",
         help = "Load configuration from this TOML file"
