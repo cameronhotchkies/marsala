@@ -7,26 +7,39 @@ Marsala is a local-first Rust LLM proxy for developers who want to see, inspect,
 Initial promise:
 
 - Run locally or in Docker.
-- Point OpenAI-compatible clients at it.
-- Proxy OpenAI requests faithfully.
-- Log request and response lifecycle locally.
-- Preserve streaming behavior.
-- Add controlled response cleanup and tool-call capture once the traffic path is reliable.
+- Preserve the currently shipped explicit OpenAI-shaped gateway as a compatibility path.
+- Acquire real Codex traffic through Marsala and prove the routing mechanism before adding mutation features.
+- Log request and response lifecycle locally with safe defaults.
+- Preserve observed streaming behavior once the traffic path is understood.
+- Add controlled response cleanup and tool-call capture once Codex traffic acquisition is reliable.
 
 Later promise:
 
-- Intercept CLIs via `HTTP_PROXY` and `HTTPS_PROXY`.
+- Expand from Codex to other CLI and SDK clients.
 - MITM only allowlisted LLM hosts, never arbitrary traffic.
-- Add Anthropic and local providers after the OpenAI-shaped path has proven its abstractions.
+- Add Anthropic and local providers after the Codex and OpenAI-shaped paths have proven their abstractions.
 
 ## Key Decisions
 
-- No MITM in the first milestone.
-- The first internal model is OpenAI-shaped, not provider-neutral.
-- Streaming is faithful passthrough before any streaming mutation.
-- Logging is local and useful, but auth headers and known secrets are redacted.
+- The current committed non-streaming `/v1/chat/completions` proxy stays as a compatibility scaffold, not the product-defining baseline.
+- The next milestone is Codex traffic acquisition and interception viability.
+- The first internal model can stay OpenAI-shaped while Codex routing details are still being discovered.
+- Marsala does not claim to intercept Codex traffic today; that is the baseline use case to prove next.
+- Proxy and CLI interception work moves ahead of streaming, rewrite, and tool-capture semantics.
+- Streaming is observed and preserved before any streaming mutation.
+- Logging is local and useful, but auth headers, proxy credentials, and known secrets are redacted.
 - Tool-call capture starts with complete non-streaming calls, then moves to streamed reconstruction.
-- CLI interception enters only after the explicit HTTP gateway is useful.
+- CLI interception is no longer deferred until late-phase feature work; it is the next baseline question to retire.
+
+## Must-Verify Unknowns
+
+- [ ] Codex custom base URL support: whether Codex can be pointed directly at Marsala with a base URL, host override, or equivalent documented/undocumented setting.
+- [ ] Proxy env behavior: exact precedence and fallback behavior for `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, including whether Codex ignores any of them.
+- [ ] Actual hosts and endpoints: the concrete upstream hostnames, ports, and request paths Codex uses in the baseline workflow.
+- [ ] API surface: whether Codex uses the Responses API, chat completions, or another endpoint family on the baseline path.
+- [ ] Streaming shape: framing, chunk ordering, completion markers, and cancellation behavior Marsala must preserve.
+- [ ] Auth and session forwarding: which inbound auth headers, bearer tokens, cookies, session headers, or device identifiers must pass through unchanged, and what must always be redacted.
+- [ ] TLS, MITM, and cert trust requirements: whether inspectable interception needs `CONNECT` handling only, full TLS interception, local CA trust, HTTP/2 handling, ALPN/SNI awareness, or tolerance for certificate pinning.
 
 ## Recommended Defaults
 
@@ -43,9 +56,9 @@ api_key_env = "OPENAI_API_KEY"
 
 [logging]
 enabled = true
-log_bodies = true
+log_bodies = false
 redact_secrets = true
-capture_stream_chunks = true
+capture_stream_chunks = false
 
 [rewrite]
 mode = "off"
@@ -95,7 +108,9 @@ Acceptance gates:
 - Clean shutdown under Ctrl-C.
 - No proxy behavior yet.
 
-## Phase 1: OpenAI Reverse Proxy, Non-Streaming
+## Compatibility Scaffold: Explicit OpenAI Chat Completions Gateway
+
+Status: current committed behavior retained as a sidecar and fixture source.
 
 Goal: local OpenAI-compatible endpoint that forwards non-streaming chat completions.
 
@@ -115,28 +130,97 @@ Acceptance gates:
 - Upstream errors are preserved.
 - Fixture tests cover success, 4xx, 5xx, malformed response, and timeout.
 
-## Phase 2: Streaming Pass-Through
+Non-goals:
 
-Goal: support `stream=true` faithfully.
+- This scaffold is not evidence that Codex traffic is routed through Marsala.
+- This scaffold does not establish Responses API compatibility.
+- This scaffold does not prove streaming, interception, or tool-capture behavior.
+
+## Phase 1: Codex Traffic Acquisition Baseline
+
+Goal: prove how Codex traffic can be routed through Marsala safely and observably enough to support the real baseline use case.
 
 Scope:
 
-- SSE pass-through.
-- Preserve event framing and ordering.
-- Observe chunks for metadata where safe.
-- Log timing, status, stream completion, and interruption.
-- No rewriting.
+- Verify the actual Codex routing mechanism in practice:
+  - whether Codex honors `HTTP_PROXY`, `HTTPS_PROXY`, both, or neither
+  - whether Codex uses direct HTTPS, `CONNECT` tunneling, or another transport shape
+  - whether explicit base URL or host overrides participate in the traffic path
+- Enumerate the concrete upstream hosts and endpoint paths Codex uses in the baseline workflow.
+- Determine the streaming response shape Marsala must preserve:
+  - SSE framing
+  - chunk boundaries and ordering expectations
+  - cancellation and end-of-stream behavior
+- Characterize auth and session material on observed Codex traffic:
+  - what inbound auth headers/tokens are forwarded upstream
+  - whether Marsala ever substitutes env-sourced upstream credentials in this path
+  - what must always be redacted from logs
+- Establish safe logging defaults for the baseline:
+  - metadata on by default
+  - request/response body capture off unless explicitly enabled
+  - stream chunk capture off by default until shape and volume are understood
+- Keep the explicit `/v1/chat/completions` gateway available as a controlled comparison path and compatibility scaffold.
 
 Acceptance gates:
 
-- OpenAI SDK streaming works through Marsala.
-- Client cancellation cleans up upstream work.
-- Mid-stream upstream error is logged.
-- Fixtures cover fragmented chunks and final usage events.
+- A documented reproduction shows how Codex is routed through Marsala on a developer machine, with exact proxy env behavior called out.
+- The routing result is explicit for both `HTTP_PROXY` and `HTTPS_PROXY`, including whether one is ignored.
+- The concrete Codex hosts and endpoint paths observed in the baseline workflow are recorded.
+- The plan records what Marsala will need to distinguish later: explicit gateway, tunneled proxy traffic, or payload-inspected traffic.
+- The streaming shape is characterized well enough to name the framing Marsala must preserve and the cases still unsupported.
+- The observed auth/session shape is written down from sanitized captures without storing raw credentials.
+- Safe logging defaults are verified: no raw bearer tokens, no proxy credentials, and no stream/body capture unless explicitly enabled.
+- The existing explicit chat completions gateway still works as a compatibility scaffold and does not define success for this milestone.
 
-## Phase 3: Logging And Redaction Hardening
+## Phase 2: CLI Routing And Forward Proxy Baseline
 
-Goal: make logging useful without becoming a liability.
+Goal: route real Codex traffic through Marsala with explicit proxy behavior and observable tunnel/intercept outcomes.
+
+Scope:
+
+- Proxy listener, for example `localhost:8788`.
+- Plain HTTP proxy support.
+- HTTPS `CONNECT` tunnel support.
+- Metadata logging: target host, port, tunnel duration, byte counts if practical, and whether traffic was tunneled or inspected.
+- Support the validated Codex routing path discovered in Phase 1, including env-var precedence and exclusions.
+- Keep non-allowlisted traffic tunneled or rejected by policy; no arbitrary inspection.
+- No claim of decrypted payload interception unless the trust path is verified.
+
+Acceptance gates:
+
+- The validated Codex proxy path can be reproduced on a developer machine.
+- The observed behavior for `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` is documented and reflected in tests or fixtures where possible.
+- HTTPS traffic can tunnel untouched when interception is not available or not trusted.
+- Marsala can report whether a Codex connection was tunneled, explicitly gatewayed, or payload-inspected.
+- The auth forwarding policy for routed/proxied Codex traffic is implemented without storing raw credentials.
+- Non-LLM traffic is not inspected by default.
+
+## Phase 3: Interception Viability And Trust Requirements
+
+Goal: determine whether Codex payload interception is possible, required, and supportable on the baseline path.
+
+Scope:
+
+- Decide whether the validated Codex path can be satisfied by base URL routing, proxying, or requires allowlisted MITM.
+- If payload interception is required, spike the minimum trust path:
+  - local CA generation
+  - CA print/export commands
+  - trust setup documentation
+  - per-host certificate generation
+  - explicit failure behavior when trust is missing
+- Record TLS transport details that affect feasibility: `CONNECT`, SNI, ALPN, HTTP/2, and certificate pinning behavior.
+- Keep interception allowlisted and opt-in.
+
+Acceptance gates:
+
+- The plan states clearly whether Marsala can inspect Codex payloads today, or only tunnel them, with evidence.
+- Any requirement for local CA trust or MITM is recorded with exact setup steps and failure modes.
+- The concrete host allowlist and transport constraints for inspectable traffic are documented.
+- No doc claims inspectable Codex interception unless this phase has been proven.
+
+## Phase 4: Logging And Redaction Hardening
+
+Goal: make logging useful without becoming a liability on the validated baseline path.
 
 Scope:
 
@@ -152,12 +236,31 @@ Acceptance gates:
 
 - Default logs contain no raw bearer tokens.
 - Body logging can be disabled and verified.
-- Redaction covers nested JSON fields and headers.
+- Redaction covers nested JSON fields, headers, and proxy credentials.
 - Concurrent requests do not corrupt logs or stall proxying badly.
 
-## Phase 4: Non-Streaming Response Rewriting
+## Phase 5: Streaming Pass-Through
 
-Goal: controlled mutation for complete JSON responses only.
+Goal: support the observed streaming shape faithfully after the traffic path is proven.
+
+Scope:
+
+- SSE pass-through.
+- Preserve event framing and ordering.
+- Observe chunks for metadata where safe.
+- Log timing, status, stream completion, and interruption.
+- No rewriting.
+
+Acceptance gates:
+
+- The baseline client streaming path works through Marsala without changing framing semantics.
+- Client cancellation cleans up upstream work.
+- Mid-stream upstream error is logged.
+- Fixtures cover fragmented chunks and final usage events.
+
+## Phase 6: Non-Streaming Response Rewriting
+
+Goal: controlled mutation for complete JSON responses only, after routing and streaming behavior are understood.
 
 Scope:
 
@@ -175,7 +278,7 @@ Acceptance gates:
 - Usage metadata is preserved, removed, or marked suspect according to a documented rule.
 - OpenAI SDK still accepts transformed responses.
 
-## Phase 5: Tool-Call Capture, Non-Streaming First
+## Phase 7: Tool-Call Capture, Non-Streaming First
 
 Goal: complete tool calls are captured reliably before streamed reconstruction.
 
@@ -205,7 +308,7 @@ name = "filesystem-write"
 arguments_regex = "apply_patch|write_file|overwrite"
 ```
 
-## Phase 6: Streamed Tool-Call Reconstruction
+## Phase 8: Streamed Tool-Call Reconstruction
 
 Goal: streamed tool calls are assembled from deltas.
 
@@ -223,50 +326,6 @@ Acceptance gates:
 - Recorded OpenAI streamed tool-call fixtures reconstruct correctly.
 - Partial deltas are logged separately from completed tool calls.
 - Malformed reconstruction does not break client streaming.
-
-## Phase 7: Plain CLI Forward Proxy
-
-Goal: proxy env vars can route traffic through Marsala without MITM.
-
-Scope:
-
-- Proxy listener, for example `localhost:8788`.
-- Plain HTTP proxy support.
-- HTTPS `CONNECT` tunnel support.
-- Metadata logging: target host, port, tunnel duration, and byte counts if practical.
-- Allowlist policy scaffolding.
-- No TLS interception yet.
-
-Acceptance gates:
-
-- `HTTP_PROXY` and `HTTPS_PROXY` can point at Marsala.
-- HTTPS traffic tunnels untouched.
-- LLM host connections are visible at metadata level.
-- Non-LLM traffic is not inspected.
-
-## Phase 8: Allowlisted MITM For LLM Hosts
-
-Goal: Marsala can inspect selected provider HTTPS traffic.
-
-Scope:
-
-- Local CA generation.
-- CA print/export commands.
-- Trust setup documentation.
-- Per-host certificate generation.
-- MITM only for configured hosts.
-- Default action for non-allowlisted hosts: tunnel.
-- Intercepted OpenAI request parsing.
-- Shared logging path with normal ingress where practical.
-
-Acceptance gates:
-
-- `api.openai.com` can be intercepted when explicitly allowlisted.
-- Non-allowlisted hosts are never MITMed.
-- Startup shows intercepted hosts and DB/log path.
-- Users can see whether a connection was tunneled or intercepted.
-- Failure modes are explicit when clients do not trust the CA.
-- Clear uninstall/remove-CA procedure exists.
 
 ## Phase 9: Provider Expansion
 
@@ -287,14 +346,15 @@ Acceptance gates:
 
 ## Defensible Build Order
 
-1. Build the OpenAI-shaped gateway.
-2. Make logging and redaction trustworthy.
-3. Add streaming passthrough.
-4. Add buffered-only mutation.
-5. Add complete tool-call capture.
-6. Add streamed tool-call reconstruction.
-7. Add CLI tunnel proxy.
-8. Add allowlisted MITM.
-9. Generalize providers.
+1. Keep the explicit OpenAI-shaped gateway as a compatibility scaffold.
+2. Verify Codex routing, hosts, auth handling, and streaming shape.
+3. Add the proxy path and tunnel behavior required to reproduce the Codex baseline.
+4. Resolve interception viability and trust requirements before claiming inspectable Codex traffic.
+5. Make logging and redaction trustworthy for the Codex baseline.
+6. Add streaming passthrough where the observed traffic path needs it.
+7. Add buffered-only mutation.
+8. Add complete tool-call capture.
+9. Add streamed tool-call reconstruction.
+10. Generalize providers.
 
-This keeps the ambition intact while avoiding the failure mode of spending the first month building a fragile MITM proxy before the product can proxy one ordinary LLM request.
+This keeps the ambition intact while avoiding two symmetrical mistakes: treating the compatibility gateway as the product, or assuming Codex interception will fall out automatically once an SDK proxy exists.

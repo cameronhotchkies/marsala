@@ -1,6 +1,8 @@
 # Marsala
 
-Phase 1 is a local-first Rust service skeleton with a non-streaming OpenAI-shaped chat completions proxy. It starts cleanly, loads config from TOML and env, exposes `GET /healthz` plus `POST /v1/chat/completions`, writes JSONL events, and shuts down on `Ctrl-C`.
+Marsala currently ships a local-first Rust service skeleton with a non-streaming OpenAI-shaped chat completions proxy. It starts cleanly, loads config from TOML and env, exposes `GET /healthz` plus `POST /v1/chat/completions`, writes JSONL events, and shuts down on `Ctrl-C`.
+
+That explicit gateway remains supported as a compatibility path. It is not proof that Marsala intercepts Codex today. The next baseline work is Codex traffic acquisition/interception viability: verifying routing, proxy env behavior, upstream hosts/endpoints, streaming shape, auth forwarding policy, and safe logging defaults.
 
 ## Prerequisites
 
@@ -67,14 +69,14 @@ export MARSALA__LOGGING__LOG_BODIES=true
 export OPENAI_API_KEY=sk-...
 ```
 
-`marsala.example.toml` shows the active Phase 1 config surface. Use `cargo run -p marsala -- config print --all` to inspect the full effective config, including roadmap placeholders that are not active yet.
+`marsala.example.toml` shows the current compatibility-gateway config surface. Use `cargo run -p marsala -- config print --all` to inspect the full effective config, including roadmap placeholders that are not active yet.
 
-Phase 1 OpenAI upstream settings:
+Current explicit chat-completions gateway settings:
 
 - `openai.base_url`: upstream base, default `https://api.openai.com/v1`
 - `openai.api_key_env`: env var name that holds the upstream API key, default `OPENAI_API_KEY`
 - Marsala does not read inbound `Authorization` as an upstream fallback
-- `stream=true` is rejected locally in Phase 1; omit `stream` or send `false`
+- `stream=true` is rejected locally in the current compatibility gateway; omit `stream` or send `false`
 
 ## Docker
 
@@ -90,10 +92,10 @@ The container overrides a few runtime settings:
 - bind host becomes `0.0.0.0`
 - `logging.capture_stream_chunks=false`
 
-## Phase 1 CLI
+## Current CLI surface
 
 - `serve`: start the Axum server
-- `config print`: print the merged active Phase 1 config (`server`, `openai`, `logging`)
+- `config print`: print the merged active gateway config (`server`, `openai`, `logging`)
 - `config print --all`: include roadmap sections such as `openai`, `rewrite`, `tool_capture`, `proxy`, and `mitm`
 - `logs tail`: print the last JSONL entries, with optional `--follow`
 - `logs tail --follow`: prints one waiting message to stderr when `logs/events.jsonl` does not exist yet, then resumes on file creation or recreation

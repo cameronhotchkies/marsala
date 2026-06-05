@@ -1,11 +1,13 @@
 # Initial PM Plan
 
+> Supersession note (2026-06-04): This document predates the clarified thesis. Treat proxy interception and MITM language here as original intent, not current capability or validated sequencing. The reconciled plan in `03_reconciled_plan.md` is the source of truth: Marsala currently ships a non-streaming `/v1/chat/completions` compatibility scaffold, and proving Codex traffic acquisition/interception viability is the next baseline milestone.
+
 ## Elevator Pitch Hit List
 
 - Rust-native LLM proxy that can run locally or in Docker.
 - OpenAI-first, OpenAI-compatible ingress from day one.
-- Works as both an explicit API gateway and a CLI interception proxy.
-- Supports `HTTP_PROXY` / `HTTPS_PROXY` forward-proxy mode with MITM for allowlisted LLM hosts.
+- Intended to grow from an explicit API gateway into a CLI interception proxy.
+- Forward-proxy and allowlisted MITM support were assumed too early here and require separate viability work.
 - Captures requests, responses, streaming chunks, tool calls, timings, and errors into aggressive local logs.
 - Rewrites responses to remove filler and enforce local response hygiene.
 - Detects and records tool calls matching user-defined patterns.
@@ -16,12 +18,12 @@
 
 `marsala` is a local Rust service that sits between developer tools and LLM providers.
 
-It supports two intended modes:
+This draft framed two intended modes:
 
 1. OpenAI-compatible ingress, where clients point `OPENAI_BASE_URL` or equivalent at Marsala.
-2. CLI interception proxy, where CLI traffic flows through Marsala via `HTTP_PROXY` and `HTTPS_PROXY`.
+2. CLI interception proxy, where CLI traffic would flow through Marsala via `HTTP_PROXY` and `HTTPS_PROXY` once that path is proven.
 
-For HTTPS interception, Marsala should only MITM explicitly allowlisted LLM hosts. Everything else should tunnel untouched or be rejected based on config.
+If HTTPS interception is eventually required, Marsala should only MITM explicitly allowlisted LLM hosts. Everything else should tunnel untouched or be rejected based on config.
 
 ## Core Goals
 
@@ -30,7 +32,7 @@ For HTTPS interception, Marsala should only MITM explicitly allowlisted LLM host
 - Log full request and response lifecycle locally.
 - Rewrite assistant responses to remove filler.
 - Capture tool calls by pattern.
-- Intercept CLI traffic through HTTP/HTTPS proxy mode.
+- Prove CLI traffic can be intercepted through HTTP/HTTPS proxy mode.
 - Keep the architecture small, testable, and provider-extensible.
 
 ## Initial Phase Sketch
@@ -41,7 +43,7 @@ For HTTPS interception, Marsala should only MITM explicitly allowlisted LLM host
 4. Rewriting: deterministic filler removal, before/after logs, buffered response support.
 5. Tool call capture: match by tool name and arguments regex, including streamed tool-call assembly.
 6. Forward proxy without MITM: HTTP proxy support, HTTPS `CONNECT` tunneling, proxy metadata logs.
-7. MITM for allowlisted LLM hosts: local CA, per-host certificates, decrypted OpenAI request parsing.
+7. Allowlisted MITM viability, only if required by the validated Codex path: local CA, per-host certificates, decrypted OpenAI request parsing.
 8. Packaging and developer UX: README, Docker Compose, examples, shell snippets, troubleshooting.
 9. Provider expansion: Anthropic spike, local OpenAI-compatible provider config, model routing.
 
@@ -57,7 +59,7 @@ For HTTPS interception, Marsala should only MITM explicitly allowlisted LLM host
 
 ## PM Recommendation
 
-Build the plain OpenAI-compatible gateway first. Do not start with MITM.
+Build the plain OpenAI-compatible gateway first as a compatibility scaffold. Do not treat that as proof of Codex interception, and do not start with MITM.
 
 The project should earn abstractions through this sequence:
 
@@ -65,5 +67,5 @@ The project should earn abstractions through this sequence:
 2. Add logging.
 3. Add streaming.
 4. Add rewriting and tool capture.
-5. Add forward proxy tunneling.
-6. Add MITM only after request lifecycle logging is solid.
+5. Verify Codex routing and add forward proxy tunneling where the baseline path needs it.
+6. Add allowlisted MITM only after the routing path and trust requirements are understood.
