@@ -1,12 +1,16 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
+use std::{fmt, future::Future, pin::Pin};
 
 use anyhow::{Context, Result};
-use axum::http::{
-    header::{ACCEPT, AUTHORIZATION},
-    HeaderMap, HeaderName, StatusCode,
+use axum::{
+    body::Bytes,
+    http::{
+        header::{ACCEPT, AUTHORIZATION},
+        HeaderMap, HeaderName, StatusCode,
+    },
 };
+use futures_core::Stream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -71,6 +75,14 @@ pub struct UpstreamResponse {
     pub body: Vec<u8>,
 }
 
+pub type UpstreamBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, UpstreamError>> + Send>>;
+
+pub struct UpstreamStreamingResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: UpstreamBodyStream,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamError {
     Timeout,
@@ -78,13 +90,32 @@ pub enum UpstreamError {
     Transport(String),
 }
 
+impl fmt::Display for UpstreamError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UpstreamError::Timeout => formatter.write_str("upstream timeout"),
+            UpstreamError::InvalidResponse(message) => {
+                write!(formatter, "invalid upstream response: {message}")
+            }
+            UpstreamError::Transport(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub type ClientFuture<'a> =
     Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + 'a>>;
+pub type StreamingClientFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<UpstreamStreamingResponse, UpstreamError>> + Send + 'a>>;
 
 pub trait OpenAiCompatibleClient: Send + Sync {
     fn send_chat_completions<'a>(&'a self, request: UpstreamChatRequest) -> ClientFuture<'a>;
 
     fn send_responses<'a>(&'a self, request: UpstreamResponsesRequest) -> ClientFuture<'a>;
+
+    fn send_responses_stream<'a>(
+        &'a self,
+        request: UpstreamResponsesRequest,
+    ) -> StreamingClientFuture<'a>;
 }
 
 #[derive(Clone)]
@@ -156,6 +187,47 @@ impl ReqwestOpenAiCompatibleClient {
             body,
         })
     }
+
+    async fn send_streaming_request(
+        &self,
+        url: String,
+        request: UpstreamRequest,
+    ) -> Result<UpstreamStreamingResponse, UpstreamError> {
+        let default_accept = !request.headers.contains_key(ACCEPT);
+        let mut builder = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {}", request.api_key));
+
+        for (name, value) in &request.headers {
+            if name != AUTHORIZATION {
+                builder = builder.header(name, value);
+            }
+        }
+
+        if default_accept {
+            builder = builder.header(ACCEPT, "text/event-stream");
+        }
+
+        let response = builder
+            .body(request.body)
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let status = StatusCode::from_u16(response.status().as_u16()).map_err(|error| {
+            UpstreamError::InvalidResponse(format!("invalid upstream status code: {error}"))
+        })?;
+        let headers = filter_upstream_response_headers(response.headers());
+        let body = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(map_body_error));
+
+        Ok(UpstreamStreamingResponse {
+            status,
+            headers,
+            body: Box::pin(body),
+        })
+    }
 }
 
 impl OpenAiCompatibleClient for ReqwestOpenAiCompatibleClient {
@@ -168,6 +240,16 @@ impl OpenAiCompatibleClient for ReqwestOpenAiCompatibleClient {
 
     fn send_responses<'a>(&'a self, request: UpstreamResponsesRequest) -> ClientFuture<'a> {
         Box::pin(async move { self.send_json_request(self.responses_url(), request).await })
+    }
+
+    fn send_responses_stream<'a>(
+        &'a self,
+        request: UpstreamResponsesRequest,
+    ) -> StreamingClientFuture<'a> {
+        Box::pin(async move {
+            self.send_streaming_request(self.responses_url(), request)
+                .await
+        })
     }
 }
 
@@ -442,6 +524,78 @@ mod tests {
         assert_eq!(json["authorization"], "Bearer sk-test-secret");
         assert_eq!(json["body"]["model"], "gpt-5");
         assert_eq!(json["body"]["metadata"]["trace"], "abc");
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_streams_configured_responses_endpoint() {
+        async fn handler(headers: HeaderMap, request: Request) -> impl IntoResponse {
+            let auth = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let accept = headers
+                .get(ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let path = request.uri().path().to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("request body");
+
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", HeaderValue::from_static("text/event-stream")),
+                    ("x-request-id", HeaderValue::from_static("resp_stream_req_123")),
+                ],
+                format!(
+                    "event: response.output_text.delta\ndata: {{\"path\":\"{path}\",\"authorization\":\"{auth}\",\"accept\":\"{accept}\",\"body\":{}}}\n\n",
+                    std::str::from_utf8(&body).expect("utf8 body")
+                ),
+            )
+        }
+
+        let (base_url, _server) =
+            spawn_axum_server(Router::new().route("/v1/responses", post(handler))).await;
+        let client = ReqwestOpenAiCompatibleClient::new(&base_url).expect("reqwest client");
+
+        let response = client
+            .send_responses_stream(UpstreamResponsesRequest {
+                api_key: "sk-test-secret".to_string(),
+                headers: request_headers(&[("content-type", "application/json")]),
+                body: br#"{"model":"gpt-5","input":"hi","stream":true}"#.to_vec(),
+            })
+            .await
+            .expect("upstream response");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("resp_stream_req_123")
+        );
+
+        let mut body_stream = response.body;
+        let mut body = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            body.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        let body = String::from_utf8(body).expect("utf8 stream body");
+        assert!(body.contains(r#""path":"/v1/responses""#));
+        assert!(body.contains(r#""authorization":"Bearer sk-test-secret""#));
+        assert!(body.contains(r#""accept":"text/event-stream""#));
+        assert!(body.contains(r#""stream":true"#));
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 use std::{
-    env,
+    env, io,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -20,6 +22,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_core::Stream;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::info;
@@ -30,7 +33,7 @@ use crate::{
     openai::{
         filter_client_request_headers, filter_upstream_response_headers, ChatCompletionsRequest,
         OpenAiCompatibleClient, ReqwestOpenAiCompatibleClient, ResponsesRequest,
-        UpstreamChatRequest, UpstreamError, UpstreamResponsesRequest,
+        UpstreamBodyStream, UpstreamChatRequest, UpstreamError, UpstreamResponsesRequest,
     },
 };
 
@@ -114,29 +117,6 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Byte
 
     let request_body = body.to_vec();
 
-    if parsed_request.stream_requested() {
-        emit_responses_request_log(
-            &state,
-            &request_id,
-            &headers,
-            &content_type,
-            Some(&parsed_request),
-            request_body.len(),
-            "marsala_local",
-        );
-        return local_responses_error_response(
-            &state,
-            &request_id,
-            StatusCode::BAD_REQUEST,
-            "unsupported_streaming",
-            "Marsala does not yet support /v1/responses stream=true passthrough; retry with stream omitted or false",
-            started.elapsed().as_millis() as u64,
-            content_type,
-            Some("application/json".to_string()),
-            "marsala_local",
-        );
-    }
-
     let api_key = match load_api_key(&state.config.openai.api_key_env) {
         Ok(api_key) => api_key,
         Err(message) => {
@@ -162,6 +142,75 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Byte
             );
         }
     };
+
+    if parsed_request.stream_requested() {
+        emit_responses_request_log(
+            &state,
+            &request_id,
+            &headers,
+            &content_type,
+            Some(&parsed_request),
+            request_body.len(),
+            "upstream",
+        );
+
+        let upstream_response = state
+            .openai_client
+            .send_responses_stream(UpstreamResponsesRequest {
+                api_key,
+                headers: upstream_headers,
+                body: request_body,
+            })
+            .await;
+
+        return match upstream_response {
+            Ok(upstream) => {
+                let response_headers = filter_upstream_response_headers(&upstream.headers);
+                let stream = LoggedResponseStream::new(
+                    upstream.body,
+                    state,
+                    request_id,
+                    upstream.status,
+                    header_value(&response_headers, CONTENT_TYPE),
+                    started,
+                );
+                build_streaming_response(upstream.status, &response_headers, stream)
+            }
+            Err(UpstreamError::Timeout) => local_responses_error_response(
+                &state,
+                &request_id,
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "Marsala timed out while waiting for the configured OpenAI-compatible upstream",
+                started.elapsed().as_millis() as u64,
+                content_type,
+                Some("application/json".to_string()),
+                "marsala_local",
+            ),
+            Err(UpstreamError::InvalidResponse(message)) => local_responses_error_response(
+                &state,
+                &request_id,
+                StatusCode::BAD_GATEWAY,
+                "invalid_upstream_response",
+                &format!("upstream response was malformed or incomplete: {message}"),
+                started.elapsed().as_millis() as u64,
+                content_type,
+                Some("application/json".to_string()),
+                "marsala_local",
+            ),
+            Err(UpstreamError::Transport(message)) => local_responses_error_response(
+                &state,
+                &request_id,
+                StatusCode::BAD_GATEWAY,
+                "upstream_connection_error",
+                &format!("failed to reach configured OpenAI-compatible upstream: {message}"),
+                started.elapsed().as_millis() as u64,
+                content_type,
+                Some("application/json".to_string()),
+                "marsala_local",
+            ),
+        };
+    }
 
     emit_responses_request_log(
         &state,
@@ -514,6 +563,40 @@ fn emit_responses_response_log(
         .emit("responses_response", Value::Object(data));
 }
 
+fn emit_responses_stream_response_log(
+    state: &AppState,
+    request_id: &str,
+    status: StatusCode,
+    elapsed_ms: u64,
+    content_type: Option<String>,
+    stream_status: &str,
+    body_bytes: u64,
+    body_chunks: u64,
+    error_type: Option<&str>,
+) {
+    let mut data = Map::new();
+    data.insert("request_id".into(), request_id.into());
+    data.insert("path".into(), "/v1/responses".into());
+    data.insert("status".into(), status.as_u16().into());
+    data.insert("elapsed_ms".into(), elapsed_ms.into());
+    data.insert("source".into(), "upstream".into());
+    data.insert("stream".into(), true.into());
+    data.insert("stream_status".into(), stream_status.into());
+    data.insert("body_bytes".into(), body_bytes.into());
+    data.insert("body_chunks".into(), body_chunks.into());
+    data.insert("body_logging".into(), "disabled".into());
+    if let Some(content_type) = content_type {
+        data.insert("content_type".into(), content_type.into());
+    }
+    if let Some(error_type) = error_type {
+        data.insert("error_type".into(), error_type.into());
+    }
+
+    state
+        .event_log
+        .emit("responses_response", Value::Object(data));
+}
+
 fn emit_chat_request_log(
     state: &AppState,
     request_id: &str,
@@ -718,6 +801,92 @@ fn local_responses_error_response(
     build_response(status, &json_content_type_header(), body_bytes)
 }
 
+struct LoggedResponseStream {
+    inner: UpstreamBodyStream,
+    state: AppState,
+    request_id: String,
+    status: StatusCode,
+    content_type: Option<String>,
+    started: Instant,
+    body_bytes: u64,
+    body_chunks: u64,
+    logged: bool,
+}
+
+impl LoggedResponseStream {
+    fn new(
+        inner: UpstreamBodyStream,
+        state: AppState,
+        request_id: String,
+        status: StatusCode,
+        content_type: Option<String>,
+        started: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            state,
+            request_id,
+            status,
+            content_type,
+            started,
+            body_bytes: 0,
+            body_chunks: 0,
+            logged: false,
+        }
+    }
+
+    fn emit_once(&mut self, stream_status: &str, error_type: Option<&str>) {
+        if self.logged {
+            return;
+        }
+
+        self.logged = true;
+        emit_responses_stream_response_log(
+            &self.state,
+            &self.request_id,
+            self.status,
+            self.started.elapsed().as_millis() as u64,
+            self.content_type.clone(),
+            stream_status,
+            self.body_bytes,
+            self.body_chunks,
+            error_type,
+        );
+    }
+}
+
+impl Stream for LoggedResponseStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        match this.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.body_bytes += chunk.len() as u64;
+                this.body_chunks += 1;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let error_type = upstream_error_type(&error);
+                this.emit_once("error", Some(error_type));
+                Poll::Ready(Some(Err(io::Error::other(error.to_string()))))
+            }
+            Poll::Ready(None) => {
+                this.emit_once("completed", None);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for LoggedResponseStream {
+    fn drop(&mut self) {
+        self.emit_once("interrupted", None);
+    }
+}
+
 fn build_response(status: StatusCode, headers: &HeaderMap, body: Vec<u8>) -> Response {
     let mut response = Response::builder().status(status);
 
@@ -728,6 +897,22 @@ fn build_response(status: StatusCode, headers: &HeaderMap, body: Vec<u8>) -> Res
     response
         .body(Body::from(body))
         .expect("response construction must succeed")
+}
+
+fn build_streaming_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    stream: LoggedResponseStream,
+) -> Response {
+    let mut response = Response::builder().status(status);
+
+    for (name, value) in headers {
+        response = response.header(name, value);
+    }
+
+    response
+        .body(Body::from_stream(stream))
+        .expect("streaming response construction must succeed")
 }
 
 fn json_content_type_header() -> HeaderMap {
@@ -837,6 +1022,14 @@ fn is_json_content_type(content_type: &str) -> bool {
     content_type.starts_with("application/json") || content_type.ends_with("+json")
 }
 
+fn upstream_error_type(error: &UpstreamError) -> &'static str {
+    match error {
+        UpstreamError::Timeout => "upstream_timeout",
+        UpstreamError::InvalidResponse(_) => "invalid_upstream_response",
+        UpstreamError::Transport(_) => "upstream_connection_error",
+    }
+}
+
 fn header_value(headers: &HeaderMap, name: axum::http::header::HeaderName) -> Option<String> {
     headers
         .get(name)
@@ -869,13 +1062,14 @@ struct HealthResponse {
 mod tests {
     use std::{collections::VecDeque, env, ffi::OsString, fs, path::Path, sync::Mutex};
 
+    use futures_util::stream;
     use tower::ServiceExt;
 
     use super::*;
     use crate::{
         config::AppConfig,
         event_log::{read_tail_lines, EventLogWriter},
-        openai::{OpenAiCompatibleClient, UpstreamResponse},
+        openai::{OpenAiCompatibleClient, UpstreamResponse, UpstreamStreamingResponse},
     };
 
     struct EnvGuard {
@@ -915,6 +1109,14 @@ mod tests {
         chat_requests: Mutex<Vec<UpstreamChatRequest>>,
         responses_requests: Mutex<Vec<UpstreamResponsesRequest>>,
         upstream_responses: Mutex<VecDeque<std::result::Result<UpstreamResponse, UpstreamError>>>,
+        upstream_streaming_responses:
+            Mutex<VecDeque<std::result::Result<StubStreamingResponse, UpstreamError>>>,
+    }
+
+    struct StubStreamingResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        chunks: Vec<std::result::Result<Bytes, UpstreamError>>,
     }
 
     impl StubClient {
@@ -925,6 +1127,18 @@ mod tests {
                 chat_requests: Mutex::new(Vec::new()),
                 responses_requests: Mutex::new(Vec::new()),
                 upstream_responses: Mutex::new(responses.into()),
+                upstream_streaming_responses: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        fn with_streaming_responses(
+            responses: Vec<std::result::Result<StubStreamingResponse, UpstreamError>>,
+        ) -> Self {
+            Self {
+                chat_requests: Mutex::new(Vec::new()),
+                responses_requests: Mutex::new(Vec::new()),
+                upstream_responses: Mutex::new(VecDeque::new()),
+                upstream_streaming_responses: Mutex::new(responses.into()),
             }
         }
 
@@ -988,6 +1202,29 @@ mod tests {
                     .expect("upstream responses lock")
                     .pop_front()
                     .expect("stub response")
+            })
+        }
+
+        fn send_responses_stream<'a>(
+            &'a self,
+            request: UpstreamResponsesRequest,
+        ) -> crate::openai::StreamingClientFuture<'a> {
+            Box::pin(async move {
+                self.responses_requests
+                    .lock()
+                    .expect("responses requests lock")
+                    .push(request);
+                let response = self
+                    .upstream_streaming_responses
+                    .lock()
+                    .expect("upstream streaming responses lock")
+                    .pop_front()
+                    .expect("stub streaming response")?;
+                Ok(UpstreamStreamingResponse {
+                    status: response.status,
+                    headers: response.headers,
+                    body: Box::pin(stream::iter(response.chunks)),
+                })
             })
         }
     }
@@ -1227,7 +1464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_rejects_stream_true_without_upstream_call_and_logs_local_only() {
+    async fn responses_stream_true_calls_upstream_streams_bytes_and_logs_metadata_only() {
         let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_STREAM");
         env_guard.set("sk-upstream-secret");
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1240,25 +1477,95 @@ mod tests {
         let mut writer = EventLogWriter::spawn(&log_path, true)
             .await
             .expect("event writer");
-        let stub = Arc::new(StubClient::default());
+        let stub = Arc::new(StubClient::with_streaming_responses(vec![Ok(
+            StubStreamingResponse {
+                status: StatusCode::OK,
+                headers: test_headers(&[
+                    ("content-type", "text/event-stream"),
+                    ("x-request-id", "resp_stream_req_123"),
+                ]),
+                chunks: vec![
+                    Ok(Bytes::from_static(
+                        br#"event: response.output_text.delta
+data: {"delta":"hel","secret":"chunk-secret"}
+
+"#,
+                    )),
+                    Ok(Bytes::from_static(
+                        br#"event: response.completed
+data: {"id":"resp_123"}
+
+"#,
+                    )),
+                ],
+            },
+        )]));
         let app = build_router_with_client(config, writer.handle(), stub.clone());
+        let request_body =
+            br#"{"model":"gpt-5","input":"hello","stream":true,"token":"body-secret"}"#.to_vec();
 
         let response = app
-            .oneshot(post_responses_request(
-                br#"{"model":"gpt-5","input":"hello","stream":true}"#.to_vec(),
-            ))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer codex-secret")
+                    .header("accept", "text/event-stream")
+                    .body(Body::from(request_body.clone()))
+                    .expect("request"),
+            )
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(stub.request_count(), 0);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("resp_stream_req_123")
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let json: Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(json["error"]["type"], "unsupported_streaming");
+        assert_eq!(
+            body.as_ref(),
+            br#"event: response.output_text.delta
+data: {"delta":"hel","secret":"chunk-secret"}
+
+event: response.completed
+data: {"id":"resp_123"}
+
+"#
+        );
+
+        let upstream_request = stub.first_responses_request();
+        assert_eq!(upstream_request.api_key, "sk-upstream-secret");
+        assert_eq!(upstream_request.body, request_body);
+        assert!(upstream_request.headers.get("authorization").is_none());
+        assert_eq!(
+            upstream_request
+                .headers
+                .get("accept")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
 
         writer.shutdown().await.expect("writer shutdown");
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("codex-secret"));
+        assert!(!log_text.contains("sk-upstream-secret"));
+        assert!(!log_text.contains("body-secret"));
+        assert!(!log_text.contains("chunk-secret"));
+
         let records = read_event_records(&log_path);
         let request = records
             .iter()
@@ -1269,16 +1576,177 @@ mod tests {
             .find(|record| record["event_type"] == "responses_response")
             .expect("response event");
 
-        assert_eq!(request["data"]["target"], "marsala_local");
+        assert_eq!(request["data"]["target"], "upstream");
         assert_eq!(request["data"]["stream"], true);
-        assert!(request["data"].get("upstream_headers").is_none());
-        assert!(request["data"].get("upstream_url").is_none());
-        assert!(request["data"].get("api_key_env").is_none());
-        assert_eq!(response["data"]["source"], "marsala_local");
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization"],
+            "[redacted]"
+        );
+        assert_eq!(request["data"]["auth_shape"]["authorization_present"], true);
+        assert_eq!(request["data"]["body_logging"], "disabled");
+        assert!(request["data"].get("body").is_none());
+        assert_eq!(response["data"]["source"], "upstream");
+        assert_eq!(response["data"]["status"], 200);
+        assert_eq!(response["data"]["stream"], true);
+        assert_eq!(response["data"]["stream_status"], "completed");
+        assert_eq!(response["data"]["body_chunks"], 2);
+        assert_eq!(response["data"]["body_bytes"], body.len() as u64);
+        assert_eq!(response["data"]["body_logging"], "disabled");
+        assert!(response["data"].get("body").is_none());
         assert_eq!(
             request["data"]["request_id"],
             response["data"]["request_id"]
         );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_true_preserves_upstream_error_status_headers_and_body() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_STREAM_STATUS");
+        env_guard.set("sk-upstream-secret");
+        let app = build_test_app(
+            Arc::new(StubClient::with_streaming_responses(vec![Ok(
+                StubStreamingResponse {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    headers: test_headers(&[
+                        ("content-type", "text/event-stream"),
+                        ("retry-after", "11"),
+                        ("x-request-id", "resp_stream_429"),
+                    ]),
+                    chunks: vec![Ok(Bytes::from_static(
+                        br#"event: error
+data: {"error":{"message":"slow down"}}
+
+"#,
+                    ))],
+                },
+            )])),
+            false,
+            "PHASE1_OPENAI_API_KEY_RESPONSES_STREAM_STATUS",
+        );
+
+        let response = app
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello","stream":true}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("11")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("resp_stream_429")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            body.as_ref(),
+            br#"event: error
+data: {"error":{"message":"slow down"}}
+
+"#
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_true_logs_upstream_body_error_without_raw_chunks() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_STREAM_BODY_ERROR");
+        env_guard.set("sk-upstream-secret");
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut config = AppConfig::default();
+        config.logging.enabled = true;
+        config.logging.path = log_path.clone();
+        config.logging.log_bodies = false;
+        config.openai.api_key_env = "PHASE1_OPENAI_API_KEY_RESPONSES_STREAM_BODY_ERROR".to_string();
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let app = build_router_with_client(
+            config,
+            writer.handle(),
+            Arc::new(StubClient::with_streaming_responses(vec![Ok(
+                StubStreamingResponse {
+                    status: StatusCode::OK,
+                    headers: test_headers(&[("content-type", "text/event-stream")]),
+                    chunks: vec![
+                        Ok(Bytes::from_static(
+                            br#"event: response.output_text.delta
+data: {"delta":"partial","secret":"chunk-secret"}
+
+"#,
+                        )),
+                        Err(UpstreamError::InvalidResponse(
+                            "socket closed mid-stream".to_string(),
+                        )),
+                    ],
+                },
+            )])),
+        );
+
+        let response = app
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello","stream":true}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(body_result.is_err());
+
+        writer.shutdown().await.expect("writer shutdown");
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("chunk-secret"));
+        let records = read_event_records(&log_path);
+        let response = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_response")
+            .expect("response event");
+
+        assert_eq!(response["data"]["stream_status"], "error");
+        assert_eq!(response["data"]["error_type"], "invalid_upstream_response");
+        assert_eq!(response["data"]["body_chunks"], 1);
+        assert!(response["data"].get("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_true_returns_local_gateway_error_when_upstream_call_fails() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_STREAM_CALL_ERROR");
+        env_guard.set("sk-upstream-secret");
+        let stub = Arc::new(StubClient::with_streaming_responses(vec![Err(
+            UpstreamError::Transport("connection refused".to_string()),
+        )]));
+        let app = build_test_app(
+            stub.clone(),
+            false,
+            "PHASE1_OPENAI_API_KEY_RESPONSES_STREAM_CALL_ERROR",
+        );
+
+        let response = app
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello","stream":true}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(stub.request_count(), 1);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["type"], "upstream_connection_error");
     }
 
     #[tokio::test]

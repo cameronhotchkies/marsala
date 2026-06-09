@@ -1,6 +1,6 @@
 # Marsala
 
-Marsala currently ships a local-first Rust service skeleton with non-streaming OpenAI-shaped chat completions and Responses forwarding. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, `POST /v1/chat/completions`, and `POST /v1/responses`, writes JSONL events, and shuts down on `Ctrl-C`.
+Marsala currently ships a local-first Rust service skeleton with non-streaming OpenAI-shaped chat completions and Responses forwarding, plus streaming passthrough for `POST /v1/responses` with `stream=true`. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, `POST /v1/chat/completions`, and `POST /v1/responses`, writes JSONL events, and shuts down on `Ctrl-C`.
 
 That explicit gateway remains supported as a compatibility path for Codex custom providers. The proxy probe verifies routing, proxy env behavior, visible upstream hosts/endpoints, auth-shape redaction, and safe logging defaults. It does not implement body capture, stream capture, MITM, or TLS decryption.
 
@@ -81,9 +81,10 @@ Current explicit gateway settings:
 - `openai.api_key_env`: env var name that holds the upstream API key, default `OPENAI_API_KEY`
 - Marsala does not read inbound `Authorization` as an upstream fallback
 - `/v1/chat/completions` and `/v1/responses` forward non-streaming JSON requests to the configured upstream
-- `stream=true` is rejected locally; omit `stream` or send `false`
+- `/v1/responses` with `stream=true` streams upstream bytes through without parsing or mutating chunks
+- `/v1/chat/completions` with `stream=true` is still rejected locally
 
-Codex custom-provider steel thread:
+Codex custom-provider steel thread. Use a custom provider and disable provider WebSockets so Codex uses the HTTP Responses stream path that Marsala currently supports:
 
 ```bash
 OPENAI_API_KEY=sk-... cargo run -p marsala -- serve
@@ -95,6 +96,7 @@ CODEX_API_KEY=sk-local-routed-through-marsala codex exec \
   -c 'model_providers.marsala_responses.base_url="http://127.0.0.1:8787/v1"' \
   -c 'model_providers.marsala_responses.env_key="CODEX_API_KEY"' \
   -c 'model_providers.marsala_responses.wire_api="responses"' \
+  -c 'model_providers.marsala_responses.supports_websockets=false' \
   'Reply with one short sentence.'
 ```
 
@@ -106,6 +108,7 @@ Proxy probe settings:
 - Plain HTTP proxy requests are logged and return local `501 not_implemented`
 - HTTPS `CONNECT` requests are logged and tunneled without MITM or decryption
 - Body logging and stream capture are disabled by default
+- WebSocket upgrade/proxy support for `/v1/responses` is not implemented; use the custom-provider `supports_websockets=false` setting above for Codex validation
 
 See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
 
