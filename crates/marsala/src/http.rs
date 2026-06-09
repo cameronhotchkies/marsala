@@ -11,7 +11,10 @@ use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header::CONTENT_TYPE, HeaderMap, Request, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE},
+        HeaderMap, HeaderName, Request, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -58,6 +61,7 @@ fn build_router_with_client(
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses_observation))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_logging_middleware,
@@ -72,6 +76,41 @@ async fn healthz() -> impl IntoResponse {
             status: "ok",
             service: "marsala",
         }),
+    )
+}
+
+async fn responses_observation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request_id = next_request_id();
+    let started = Instant::now();
+    let content_type = header_value(&headers, CONTENT_TYPE);
+
+    emit_responses_request_log(&state, &request_id, &headers, &content_type, body.len());
+
+    let body = serde_json::json!({
+        "error": {
+            "message": "Marsala observed /v1/responses traffic, but forwarding for this endpoint is not implemented in this validation probe",
+            "type": "not_implemented",
+            "source": "marsala",
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).expect("serialize local error body");
+    emit_responses_response_log(
+        &state,
+        &request_id,
+        StatusCode::NOT_IMPLEMENTED,
+        started.elapsed().as_millis() as u64,
+        Some("application/json".to_string()),
+        body_bytes.len(),
+    );
+
+    build_response(
+        StatusCode::NOT_IMPLEMENTED,
+        &json_content_type_header(),
+        body_bytes,
     )
 }
 
@@ -276,6 +315,59 @@ async fn request_logging_middleware(
     );
 
     response
+}
+
+fn emit_responses_request_log(
+    state: &AppState,
+    request_id: &str,
+    headers: &HeaderMap,
+    content_type: &Option<String>,
+    body_bytes: usize,
+) {
+    let mut data = Map::new();
+    data.insert("request_id".into(), request_id.into());
+    data.insert("method".into(), "POST".into());
+    data.insert("path".into(), "/v1/responses".into());
+    data.insert("target".into(), "marsala_local".into());
+    data.insert("auth_shape".into(), Value::Object(auth_shape(headers)));
+    if let Some(content_type) = content_type {
+        data.insert("content_type".into(), content_type.clone().into());
+    }
+    data.insert("body_bytes".into(), (body_bytes as u64).into());
+    if state.config.logging.log_bodies {
+        data.insert("body_logging".into(), "omitted_for_probe".into());
+    } else {
+        data.insert("body_logging".into(), "disabled".into());
+    }
+
+    state
+        .event_log
+        .emit("responses_request", Value::Object(data));
+}
+
+fn emit_responses_response_log(
+    state: &AppState,
+    request_id: &str,
+    status: StatusCode,
+    elapsed_ms: u64,
+    content_type: Option<String>,
+    body_bytes: usize,
+) {
+    let mut data = Map::new();
+    data.insert("request_id".into(), request_id.into());
+    data.insert("path".into(), "/v1/responses".into());
+    data.insert("status".into(), status.as_u16().into());
+    data.insert("elapsed_ms".into(), elapsed_ms.into());
+    data.insert("source".into(), "marsala_local".into());
+    data.insert("body_bytes".into(), (body_bytes as u64).into());
+    data.insert("body_logging".into(), "disabled".into());
+    if let Some(content_type) = content_type {
+        data.insert("content_type".into(), content_type.into());
+    }
+
+    state
+        .event_log
+        .emit("responses_response", Value::Object(data));
 }
 
 fn emit_chat_request_log(
@@ -491,10 +583,76 @@ fn redact_json_value(value: &mut Value) {
 }
 
 fn should_redact_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let normalized = key.replace('_', "-");
     matches!(
-        key.to_ascii_lowercase().as_str(),
-        "authorization" | "api_key" | "api-key" | "apikey" | "x-api-key"
-    )
+        normalized.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api_key"
+            | "api-key"
+            | "apikey"
+            | "x-api-key"
+    ) || normalized.contains("token")
+        || normalized.contains("session")
+        || normalized.contains("bearer")
+}
+
+fn auth_shape(headers: &HeaderMap) -> Map<String, Value> {
+    let mut auth = Map::new();
+    add_header_presence(&mut auth, "authorization", headers, &AUTHORIZATION, true);
+    add_header_presence(
+        &mut auth,
+        "proxy_authorization",
+        headers,
+        &HeaderName::from_static("proxy-authorization"),
+        true,
+    );
+    add_header_presence(&mut auth, "cookie", headers, &COOKIE, false);
+    add_header_presence(
+        &mut auth,
+        "x_api_key",
+        headers,
+        &HeaderName::from_static("x-api-key"),
+        false,
+    );
+    auth
+}
+
+fn add_header_presence(
+    data: &mut Map<String, Value>,
+    field: &str,
+    headers: &HeaderMap,
+    name: &HeaderName,
+    include_scheme: bool,
+) {
+    let Some(value) = headers.get(name) else {
+        data.insert(format!("{field}_present"), false.into());
+        return;
+    };
+
+    data.insert(format!("{field}_present"), true.into());
+    if include_scheme {
+        data.insert(
+            format!("{field}_scheme"),
+            Value::String(auth_scheme(value.to_str().ok())),
+        );
+    }
+}
+
+fn auth_scheme(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "non_utf8".to_string();
+    };
+
+    value
+        .split_ascii_whitespace()
+        .next()
+        .filter(|scheme| !scheme.is_empty())
+        .map(|scheme| scheme.to_ascii_lowercase())
+        .unwrap_or_else(|| "opaque".to_string())
 }
 
 fn is_json_content_type(content_type: &str) -> bool {
@@ -642,6 +800,79 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "marsala");
+    }
+
+    #[tokio::test]
+    async fn responses_observation_logs_sanitized_auth_shape_without_body_capture() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut config = AppConfig::default();
+        config.logging.enabled = true;
+        config.logging.path = log_path.clone();
+        config.logging.log_bodies = false;
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let app =
+            build_router_with_client(config, writer.handle(), Arc::new(StubClient::default()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer codex-secret")
+                    .header("cookie", "sessionid=session-secret")
+                    .header("x-api-key", "sk-body-adjacent-secret")
+                    .body(Body::from(
+                        br#"{"model":"gpt-5","input":"hello","token":"body-secret"}"#.to_vec(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["type"], "not_implemented");
+
+        writer.shutdown().await.expect("writer shutdown");
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("codex-secret"));
+        assert!(!log_text.contains("session-secret"));
+        assert!(!log_text.contains("sk-body-adjacent-secret"));
+        assert!(!log_text.contains("body-secret"));
+
+        let records = read_event_records(&log_path);
+        let request = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_request")
+            .expect("responses request event");
+        let response = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_response")
+            .expect("responses response event");
+
+        assert_eq!(request["data"]["path"], "/v1/responses");
+        assert_eq!(request["data"]["target"], "marsala_local");
+        assert_eq!(request["data"]["body_logging"], "disabled");
+        assert!(request["data"].get("body").is_none());
+        assert_eq!(request["data"]["auth_shape"]["authorization_present"], true);
+        assert_eq!(
+            request["data"]["auth_shape"]["authorization_scheme"],
+            "bearer"
+        );
+        assert_eq!(request["data"]["auth_shape"]["cookie_present"], true);
+        assert_eq!(request["data"]["auth_shape"]["x_api_key_present"], true);
+        assert_eq!(response["data"]["status"], 501);
+        assert_eq!(
+            request["data"]["request_id"],
+            response["data"]["request_id"]
+        );
     }
 
     #[tokio::test]

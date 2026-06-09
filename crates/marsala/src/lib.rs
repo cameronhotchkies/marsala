@@ -3,8 +3,9 @@ pub mod config;
 pub mod event_log;
 pub mod http;
 pub mod openai;
+pub mod proxy;
 
-use std::sync::Once;
+use std::{future::IntoFuture, sync::Once};
 
 use anyhow::{Context, Result};
 use axum::serve;
@@ -12,8 +13,8 @@ use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, LogsCommand};
 use config::AppConfig;
 use event_log::EventLogWriter;
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio::{net::TcpListener, sync::watch};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 static TRACING: Once = Once::new();
@@ -63,6 +64,17 @@ async fn serve_command(config: AppConfig) -> Result<()> {
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
+    let proxy_listener = if config.proxy.enabled {
+        let proxy_bind_addr = format!("{}:{}", config.proxy.host, config.proxy.port);
+        Some((
+            proxy_bind_addr.clone(),
+            TcpListener::bind(&proxy_bind_addr)
+                .await
+                .with_context(|| format!("failed to bind proxy listener {proxy_bind_addr}"))?,
+        ))
+    } else {
+        None
+    };
 
     let local_addr = listener.local_addr().context("missing local address")?;
     let mut event_writer =
@@ -77,21 +89,75 @@ async fn serve_command(config: AppConfig) -> Result<()> {
         }),
     );
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let proxy_task = if let Some((proxy_bind_addr, proxy_listener)) = proxy_listener {
+        let proxy_local_addr = proxy_listener
+            .local_addr()
+            .context("missing proxy listener local address")?;
+        event_log.emit(
+            "proxy_listener_started",
+            serde_json::json!({
+                "bind_addr": proxy_bind_addr,
+                "local_addr": proxy_local_addr.to_string(),
+            }),
+        );
+        info!(address = %proxy_local_addr, "marsala proxy probe listening");
+        Some(tokio::spawn(proxy::serve_listener(
+            proxy_listener,
+            event_log.clone(),
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
+
     let app = http::build_router(config.clone(), event_log.clone())?;
     info!(address = %local_addr, "marsala listening");
 
     let shutdown_log = event_log.clone();
+    let mut server_shutdown_rx = shutdown_rx.clone();
     let server = serve(listener, app).with_graceful_shutdown(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("shutdown requested");
-            shutdown_log.emit(
-                "shutdown_requested",
-                serde_json::json!({ "signal": "ctrl_c" }),
-            );
+        while server_shutdown_rx.changed().await.is_ok() {
+            if *server_shutdown_rx.borrow() {
+                break;
+            }
         }
     });
 
-    let result = server.await;
+    let mut server = Box::pin(server.into_future());
+    let result = tokio::select! {
+        result = &mut server => {
+            let _ = shutdown_tx.send(true);
+            result
+        }
+        signal = tokio::signal::ctrl_c() => {
+            if signal.is_ok() {
+                info!("shutdown requested");
+                shutdown_log.emit(
+                    "shutdown_requested",
+                    serde_json::json!({ "signal": "ctrl_c" }),
+                );
+            }
+            let _ = shutdown_tx.send(true);
+            server.await
+        }
+    };
+
+    if let Some(proxy_task) = proxy_task {
+        match proxy_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "proxy probe listener exited with error");
+                if result.is_ok() {
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "proxy probe listener task panicked");
+            }
+        }
+    }
+
     let reason = if result.is_ok() {
         "graceful_shutdown"
     } else {

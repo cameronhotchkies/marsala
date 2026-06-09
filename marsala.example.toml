@@ -11,4 +11,9 @@ enabled = true
 path = "logs/events.jsonl"
 log_bodies = false
 redact_secrets = true
-capture_stream_chunks = true
+capture_stream_chunks = false
+
+[proxy]
+enabled = false
+host = "127.0.0.1"
+port = 8788

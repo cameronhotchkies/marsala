@@ -70,6 +70,7 @@ impl AppConfig {
             server: &self.server,
             openai: &self.openai,
             logging: &self.logging,
+            proxy: &self.proxy,
         })
         .context("failed to render active configuration")
     }
@@ -80,6 +81,7 @@ struct ActiveConfigView<'a> {
     server: &'a ServerConfig,
     openai: &'a OpenAiConfig,
     logging: &'a LoggingConfig,
+    proxy: &'a ProxyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,7 +133,7 @@ impl Default for LoggingConfig {
             path: PathBuf::from("logs/events.jsonl"),
             log_bodies: false,
             redact_secrets: true,
-            capture_stream_chunks: true,
+            capture_stream_chunks: false,
         }
     }
 }
@@ -291,7 +293,7 @@ mod tests {
         assert!(config.logging.enabled);
         assert!(!config.logging.log_bodies);
         assert!(config.logging.redact_secrets);
-        assert!(config.logging.capture_stream_chunks);
+        assert!(!config.logging.capture_stream_chunks);
         assert_eq!(config.rewrite.mode, "off");
         assert_eq!(config.rewrite.streaming, "passthrough");
         assert!(!config.proxy.enabled);
@@ -459,7 +461,7 @@ server = "127.0.0.1:8787"
     }
 
     #[test]
-    fn active_render_includes_openai_and_omits_later_phase_sections() {
+    fn active_render_includes_openai_proxy_and_omits_later_phase_sections() {
         let rendered = AppConfig::default()
             .to_active_toml_string()
             .expect("render active config");
@@ -467,10 +469,10 @@ server = "127.0.0.1:8787"
         assert!(rendered.contains("[server]"));
         assert!(rendered.contains("[openai]"));
         assert!(rendered.contains("[logging]"));
+        assert!(rendered.contains("[proxy]"));
         assert!(rendered.contains("log_bodies = false"));
         assert!(!rendered.contains("[rewrite]"));
         assert!(!rendered.contains("[tool_capture]"));
-        assert!(!rendered.contains("[proxy]"));
         assert!(!rendered.contains("[mitm]"));
     }
 

@@ -1,8 +1,8 @@
 # Marsala
 
-Marsala currently ships a local-first Rust service skeleton with a non-streaming OpenAI-shaped chat completions proxy. It starts cleanly, loads config from TOML and env, exposes `GET /healthz` plus `POST /v1/chat/completions`, writes JSONL events, and shuts down on `Ctrl-C`.
+Marsala currently ships a local-first Rust service skeleton with a non-streaming OpenAI-shaped chat completions proxy and a narrow Codex acquisition probe. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, `POST /v1/chat/completions`, and observation-only `POST /v1/responses`, writes JSONL events, and shuts down on `Ctrl-C`.
 
-That explicit gateway remains supported as a compatibility path. It is not proof that Marsala intercepts Codex today. The next baseline work is Codex traffic acquisition/interception viability: verifying routing, proxy env behavior, upstream hosts/endpoints, streaming shape, auth forwarding policy, and safe logging defaults.
+That explicit gateway remains supported as a compatibility path. The Codex acquisition probe verifies routing, proxy env behavior, visible upstream hosts/endpoints, auth-shape redaction, and safe logging defaults. It does not implement `/v1/responses` forwarding, body capture, stream capture, MITM, or TLS decryption.
 
 ## Prerequisites
 
@@ -69,7 +69,7 @@ export MARSALA__LOGGING__LOG_BODIES=true
 export OPENAI_API_KEY=sk-...
 ```
 
-`marsala.example.toml` shows the current compatibility-gateway config surface. Use `cargo run -p marsala -- config print --all` to inspect the full effective config, including roadmap placeholders that are not active yet.
+`marsala.example.toml` shows the current compatibility-gateway and proxy-probe config surface. Use `cargo run -p marsala -- config print --all` to inspect the full effective config, including roadmap placeholders that are not active yet.
 
 Current explicit chat-completions gateway settings:
 
@@ -77,6 +77,16 @@ Current explicit chat-completions gateway settings:
 - `openai.api_key_env`: env var name that holds the upstream API key, default `OPENAI_API_KEY`
 - Marsala does not read inbound `Authorization` as an upstream fallback
 - `stream=true` is rejected locally in the current compatibility gateway; omit `stream` or send `false`
+
+Codex acquisition probe settings:
+
+- `POST /v1/responses` logs sanitized request metadata and auth-shape, then returns local `501 not_implemented`
+- `proxy.enabled=true` starts a metadata-only proxy listener on `proxy.host:proxy.port`
+- Plain HTTP proxy requests are logged and return local `501 not_implemented`
+- HTTPS `CONNECT` requests are logged and tunneled without MITM or decryption
+- Body logging and stream capture are disabled by default
+
+See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
 
 ## Docker
 
@@ -87,15 +97,14 @@ docker build -t marsala .
 docker run --rm -p 8787:8787 -v "$(pwd)/logs:/app/logs" marsala
 ```
 
-The container overrides a few runtime settings:
+The container overrides a runtime setting:
 
 - bind host becomes `0.0.0.0`
-- `logging.capture_stream_chunks=false`
 
 ## Current CLI surface
 
 - `serve`: start the Axum server
-- `config print`: print the merged active gateway config (`server`, `openai`, `logging`)
+- `config print`: print the merged active gateway/proxy config (`server`, `openai`, `logging`, `proxy`)
 - `config print --all`: include roadmap sections such as `openai`, `rewrite`, `tool_capture`, `proxy`, and `mitm`
 - `logs tail`: print the last JSONL entries, with optional `--follow`
 - `logs tail --follow`: prints one waiting message to stderr when `logs/events.jsonl` does not exist yet, then resumes on file creation or recreation
