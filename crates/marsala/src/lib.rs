@@ -5,7 +5,7 @@ pub mod http;
 pub mod openai;
 pub mod proxy;
 
-use std::{future::IntoFuture, sync::Once};
+use std::{future::IntoFuture, sync::Once, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::serve;
@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 static TRACING: Once = Once::new();
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run() -> Result<()> {
     init_tracing();
@@ -125,10 +126,10 @@ async fn serve_command(config: AppConfig) -> Result<()> {
     });
 
     let mut server = Box::pin(server.into_future());
-    let result = tokio::select! {
+    let (result, forced_shutdown) = tokio::select! {
         result = &mut server => {
             let _ = shutdown_tx.send(true);
-            result
+            (result, false)
         }
         signal = tokio::signal::ctrl_c() => {
             if signal.is_ok() {
@@ -139,9 +140,26 @@ async fn serve_command(config: AppConfig) -> Result<()> {
                 );
             }
             let _ = shutdown_tx.send(true);
-            server.await
+            match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
+                Ok(result) => (result, false),
+                Err(_) => {
+                    warn!(
+                        timeout_secs = GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                        "graceful shutdown timed out; forcing shutdown"
+                    );
+                    shutdown_log.emit(
+                        "shutdown_forced",
+                        serde_json::json!({
+                            "reason": "graceful_shutdown_timeout",
+                            "timeout_seconds": GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                        }),
+                    );
+                    (Ok(()), true)
+                }
+            }
         }
     };
+    drop(server);
 
     if let Some(proxy_task) = proxy_task {
         match proxy_task.await {
@@ -158,7 +176,9 @@ async fn serve_command(config: AppConfig) -> Result<()> {
         }
     }
 
-    let reason = if result.is_ok() {
+    let reason = if forced_shutdown {
+        "forced_shutdown"
+    } else if result.is_ok() {
         "graceful_shutdown"
     } else {
         "server_error"

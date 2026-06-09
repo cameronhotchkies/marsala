@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -41,6 +41,7 @@ impl EventLogHandle {
 
 pub struct EventLogWriter {
     sender: Option<mpsc::UnboundedSender<EventRecord>>,
+    shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
 }
 
@@ -49,6 +50,7 @@ impl EventLogWriter {
         if !enabled {
             return Ok(Self {
                 sender: None,
+                shutdown: None,
                 task: None,
             });
         }
@@ -65,16 +67,29 @@ impl EventLogWriter {
             .open(path)
             .with_context(|| format!("failed to open {}", path.display()))?;
         let (sender, mut receiver) = mpsc::unbounded_channel::<EventRecord>();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let path = path.to_path_buf();
 
         let task = tokio::spawn(async move {
             let mut writer = BufWriter::new(file);
 
+            loop {
+                tokio::select! {
+                    record = receiver.recv() => {
+                        let Some(record) = record else {
+                            break;
+                        };
+                        write_record(&mut writer, &path, &record)?;
+                    }
+                    _ = &mut shutdown_rx => {
+                        receiver.close();
+                        break;
+                    }
+                }
+            }
+
             while let Some(record) = receiver.recv().await {
-                serde_json::to_writer(&mut writer, &record)
-                    .with_context(|| format!("failed to serialize event for {}", path.display()))?;
-                writer.write_all(b"\n")?;
-                writer.flush()?;
+                write_record(&mut writer, &path, &record)?;
             }
 
             writer.flush()?;
@@ -83,6 +98,7 @@ impl EventLogWriter {
 
         Ok(Self {
             sender: Some(sender),
+            shutdown: Some(shutdown_tx),
             task: Some(task),
         })
     }
@@ -95,6 +111,9 @@ impl EventLogWriter {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         self.sender.take();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
 
         if let Some(task) = self.task.take() {
             task.await.context("event log task panicked")??;
@@ -102,6 +121,14 @@ impl EventLogWriter {
 
         Ok(())
     }
+}
+
+fn write_record(writer: &mut BufWriter<File>, path: &Path, record: &EventRecord) -> Result<()> {
+    serde_json::to_writer(&mut *writer, record)
+        .with_context(|| format!("failed to serialize event for {}", path.display()))?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +468,29 @@ mod tests {
         let record: EventRecord = serde_json::from_str(&lines[0]).expect("json line");
         assert_eq!(record.event_type, "test_event");
         assert_eq!(record.data["ok"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn writer_shutdown_does_not_wait_for_live_handles() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("events.jsonl");
+        let mut writer = EventLogWriter::spawn(&path, true).await.expect("writer");
+        let handle = writer.handle();
+
+        handle.emit("test_event", json!({ "ok": true }));
+        tokio::time::timeout(Duration::from_secs(1), writer.shutdown())
+            .await
+            .expect("writer shutdown timed out")
+            .expect("shutdown");
+
+        let lines = read_tail_lines(&path, 10).expect("tail");
+        assert_eq!(lines.len(), 1);
+
+        let record: EventRecord = serde_json::from_str(&lines[0]).expect("json line");
+        assert_eq!(record.event_type, "test_event");
+        assert_eq!(record.data["ok"], json!(true));
+
+        drop(handle);
     }
 
     #[test]
