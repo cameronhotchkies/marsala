@@ -28,8 +28,9 @@ use crate::{
     config::AppConfig,
     event_log::EventLogHandle,
     openai::{
-        filter_client_request_headers, filter_upstream_response_headers, ChatCompletionsClient,
-        ChatCompletionsRequest, ReqwestChatCompletionsClient, UpstreamChatRequest, UpstreamError,
+        filter_client_request_headers, filter_upstream_response_headers, ChatCompletionsRequest,
+        OpenAiCompatibleClient, ReqwestOpenAiCompatibleClient, ResponsesRequest,
+        UpstreamChatRequest, UpstreamError, UpstreamResponsesRequest,
     },
 };
 
@@ -39,18 +40,18 @@ static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct AppState {
     config: Arc<AppConfig>,
     event_log: EventLogHandle,
-    openai_client: Arc<dyn ChatCompletionsClient>,
+    openai_client: Arc<dyn OpenAiCompatibleClient>,
 }
 
 pub fn build_router(config: AppConfig, event_log: EventLogHandle) -> Result<Router> {
-    let openai_client = Arc::new(ReqwestChatCompletionsClient::new(&config.openai.base_url)?);
+    let openai_client = Arc::new(ReqwestOpenAiCompatibleClient::new(&config.openai.base_url)?);
     Ok(build_router_with_client(config, event_log, openai_client))
 }
 
 fn build_router_with_client(
     config: AppConfig,
     event_log: EventLogHandle,
-    openai_client: Arc<dyn ChatCompletionsClient>,
+    openai_client: Arc<dyn OpenAiCompatibleClient>,
 ) -> Router {
     let state = AppState {
         config: Arc::new(config),
@@ -61,7 +62,7 @@ fn build_router_with_client(
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses_observation))
+        .route("/v1/responses", post(responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_logging_middleware,
@@ -79,39 +80,157 @@ async fn healthz() -> impl IntoResponse {
     )
 }
 
-async fn responses_observation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = next_request_id();
     let started = Instant::now();
     let content_type = header_value(&headers, CONTENT_TYPE);
+    let upstream_headers = filter_client_request_headers(&headers);
 
-    emit_responses_request_log(&state, &request_id, &headers, &content_type, body.len());
-
-    let body = serde_json::json!({
-        "error": {
-            "message": "Marsala observed /v1/responses traffic, but forwarding for this endpoint is not implemented in this validation probe",
-            "type": "not_implemented",
-            "source": "marsala",
+    let parsed_request = match serde_json::from_slice::<ResponsesRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            emit_responses_request_log(
+                &state,
+                &request_id,
+                &headers,
+                &content_type,
+                None,
+                body.len(),
+                "marsala_local",
+            );
+            return local_responses_error_response(
+                &state,
+                &request_id,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("request body must be valid JSON: {error}"),
+                started.elapsed().as_millis() as u64,
+                content_type,
+                None,
+                "marsala_local",
+            );
         }
-    });
-    let body_bytes = serde_json::to_vec(&body).expect("serialize local error body");
-    emit_responses_response_log(
+    };
+
+    let request_body = body.to_vec();
+
+    if parsed_request.stream_requested() {
+        emit_responses_request_log(
+            &state,
+            &request_id,
+            &headers,
+            &content_type,
+            Some(&parsed_request),
+            request_body.len(),
+            "marsala_local",
+        );
+        return local_responses_error_response(
+            &state,
+            &request_id,
+            StatusCode::BAD_REQUEST,
+            "unsupported_streaming",
+            "Marsala does not yet support /v1/responses stream=true passthrough; retry with stream omitted or false",
+            started.elapsed().as_millis() as u64,
+            content_type,
+            Some("application/json".to_string()),
+            "marsala_local",
+        );
+    }
+
+    let api_key = match load_api_key(&state.config.openai.api_key_env) {
+        Ok(api_key) => api_key,
+        Err(message) => {
+            emit_responses_request_log(
+                &state,
+                &request_id,
+                &headers,
+                &content_type,
+                Some(&parsed_request),
+                request_body.len(),
+                "marsala_local",
+            );
+            return local_responses_error_response(
+                &state,
+                &request_id,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "configuration_error",
+                &message,
+                started.elapsed().as_millis() as u64,
+                content_type,
+                Some("application/json".to_string()),
+                "marsala_local",
+            );
+        }
+    };
+
+    emit_responses_request_log(
         &state,
         &request_id,
-        StatusCode::NOT_IMPLEMENTED,
-        started.elapsed().as_millis() as u64,
-        Some("application/json".to_string()),
-        body_bytes.len(),
+        &headers,
+        &content_type,
+        Some(&parsed_request),
+        request_body.len(),
+        "upstream",
     );
 
-    build_response(
-        StatusCode::NOT_IMPLEMENTED,
-        &json_content_type_header(),
-        body_bytes,
-    )
+    let upstream_response = state
+        .openai_client
+        .send_responses(UpstreamResponsesRequest {
+            api_key,
+            headers: upstream_headers,
+            body: request_body,
+        })
+        .await;
+
+    match upstream_response {
+        Ok(upstream) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let response_headers = filter_upstream_response_headers(&upstream.headers);
+            emit_responses_response_log(
+                &state,
+                &request_id,
+                upstream.status,
+                elapsed_ms,
+                header_value(&response_headers, CONTENT_TYPE),
+                &upstream.body,
+                "upstream",
+            );
+            build_response(upstream.status, &response_headers, upstream.body)
+        }
+        Err(UpstreamError::Timeout) => local_responses_error_response(
+            &state,
+            &request_id,
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "Marsala timed out while waiting for the configured OpenAI-compatible upstream",
+            started.elapsed().as_millis() as u64,
+            content_type,
+            Some("application/json".to_string()),
+            "marsala_local",
+        ),
+        Err(UpstreamError::InvalidResponse(message)) => local_responses_error_response(
+            &state,
+            &request_id,
+            StatusCode::BAD_GATEWAY,
+            "invalid_upstream_response",
+            &format!("upstream response was malformed or incomplete: {message}"),
+            started.elapsed().as_millis() as u64,
+            content_type,
+            Some("application/json".to_string()),
+            "marsala_local",
+        ),
+        Err(UpstreamError::Transport(message)) => local_responses_error_response(
+            &state,
+            &request_id,
+            StatusCode::BAD_GATEWAY,
+            "upstream_connection_error",
+            &format!("failed to reach configured OpenAI-compatible upstream: {message}"),
+            started.elapsed().as_millis() as u64,
+            content_type,
+            Some("application/json".to_string()),
+            "marsala_local",
+        ),
+    }
 }
 
 async fn chat_completions(
@@ -322,23 +441,41 @@ fn emit_responses_request_log(
     request_id: &str,
     headers: &HeaderMap,
     content_type: &Option<String>,
+    request: Option<&ResponsesRequest>,
     body_bytes: usize,
+    target: &str,
 ) {
     let mut data = Map::new();
     data.insert("request_id".into(), request_id.into());
     data.insert("method".into(), "POST".into());
     data.insert("path".into(), "/v1/responses".into());
-    data.insert("target".into(), "marsala_local".into());
+    data.insert("target".into(), target.into());
     data.insert("auth_shape".into(), Value::Object(auth_shape(headers)));
+    if target == "upstream" {
+        data.insert(
+            "upstream_url".into(),
+            Value::String(responses_url(&state.config.openai.base_url)),
+        );
+        data.insert(
+            "api_key_env".into(),
+            Value::String(state.config.openai.api_key_env.clone()),
+        );
+        data.insert(
+            "upstream_headers".into(),
+            serde_json::json!({
+                "authorization": "[redacted]",
+                "content-type": content_type,
+            }),
+        );
+    }
     if let Some(content_type) = content_type {
         data.insert("content_type".into(), content_type.clone().into());
     }
     data.insert("body_bytes".into(), (body_bytes as u64).into());
-    if state.config.logging.log_bodies {
-        data.insert("body_logging".into(), "omitted_for_probe".into());
-    } else {
-        data.insert("body_logging".into(), "disabled".into());
+    if let Some(request) = request {
+        data.insert("stream".into(), request.stream_requested().into());
     }
+    data.insert("body_logging".into(), "disabled".into());
 
     state
         .event_log
@@ -351,18 +488,25 @@ fn emit_responses_response_log(
     status: StatusCode,
     elapsed_ms: u64,
     content_type: Option<String>,
-    body_bytes: usize,
+    body: &[u8],
+    source: &str,
 ) {
     let mut data = Map::new();
     data.insert("request_id".into(), request_id.into());
     data.insert("path".into(), "/v1/responses".into());
     data.insert("status".into(), status.as_u16().into());
     data.insert("elapsed_ms".into(), elapsed_ms.into());
-    data.insert("source".into(), "marsala_local".into());
-    data.insert("body_bytes".into(), (body_bytes as u64).into());
-    data.insert("body_logging".into(), "disabled".into());
+    data.insert("source".into(), source.into());
     if let Some(content_type) = content_type {
-        data.insert("content_type".into(), content_type.into());
+        data.insert("content_type".into(), content_type.clone().into());
+        add_response_body_log_fields(
+            &mut data,
+            body,
+            Some(&content_type),
+            state.config.logging.log_bodies,
+        );
+    } else {
+        add_response_body_log_fields(&mut data, body, None, state.config.logging.log_bodies);
     }
 
     state
@@ -541,6 +685,39 @@ fn local_error_response(
     build_response(status, &json_content_type_header(), body_bytes)
 }
 
+fn local_responses_error_response(
+    state: &AppState,
+    request_id: &str,
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    elapsed_ms: u64,
+    request_content_type: Option<String>,
+    response_content_type: Option<String>,
+    source: &str,
+) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "source": "marsala",
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).expect("serialize local error body");
+
+    emit_responses_response_log(
+        state,
+        request_id,
+        status,
+        elapsed_ms,
+        response_content_type.or(request_content_type),
+        &body_bytes,
+        source,
+    );
+
+    build_response(status, &json_content_type_header(), body_bytes)
+}
+
 fn build_response(status: StatusCode, headers: &HeaderMap, body: Vec<u8>) -> Response {
     let mut response = Response::builder().status(status);
 
@@ -678,6 +855,10 @@ fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
+fn responses_url(base_url: &str) -> String {
+    format!("{}/responses", base_url.trim_end_matches('/'))
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -694,7 +875,7 @@ mod tests {
     use crate::{
         config::AppConfig,
         event_log::{read_tail_lines, EventLogWriter},
-        openai::UpstreamResponse,
+        openai::{OpenAiCompatibleClient, UpstreamResponse},
     };
 
     struct EnvGuard {
@@ -731,8 +912,9 @@ mod tests {
 
     #[derive(Default)]
     struct StubClient {
-        requests: Mutex<Vec<UpstreamChatRequest>>,
-        responses: Mutex<VecDeque<std::result::Result<UpstreamResponse, UpstreamError>>>,
+        chat_requests: Mutex<Vec<UpstreamChatRequest>>,
+        responses_requests: Mutex<Vec<UpstreamResponsesRequest>>,
+        upstream_responses: Mutex<VecDeque<std::result::Result<UpstreamResponse, UpstreamError>>>,
     }
 
     impl StubClient {
@@ -740,35 +922,70 @@ mod tests {
             responses: Vec<std::result::Result<UpstreamResponse, UpstreamError>>,
         ) -> Self {
             Self {
-                requests: Mutex::new(Vec::new()),
-                responses: Mutex::new(responses.into()),
+                chat_requests: Mutex::new(Vec::new()),
+                responses_requests: Mutex::new(Vec::new()),
+                upstream_responses: Mutex::new(responses.into()),
             }
         }
 
         fn request_count(&self) -> usize {
-            self.requests.lock().expect("requests lock").len()
+            self.chat_requests.lock().expect("chat requests lock").len()
+                + self
+                    .responses_requests
+                    .lock()
+                    .expect("responses requests lock")
+                    .len()
         }
 
         fn first_request(&self) -> UpstreamChatRequest {
-            self.requests
+            self.chat_requests
                 .lock()
-                .expect("requests lock")
+                .expect("chat requests lock")
                 .first()
                 .expect("first request")
                 .clone()
         }
+
+        fn first_responses_request(&self) -> UpstreamResponsesRequest {
+            self.responses_requests
+                .lock()
+                .expect("responses requests lock")
+                .first()
+                .expect("first responses request")
+                .clone()
+        }
     }
 
-    impl ChatCompletionsClient for StubClient {
+    impl OpenAiCompatibleClient for StubClient {
         fn send_chat_completions<'a>(
             &'a self,
             request: UpstreamChatRequest,
         ) -> crate::openai::ClientFuture<'a> {
             Box::pin(async move {
-                self.requests.lock().expect("requests lock").push(request);
-                self.responses
+                self.chat_requests
                     .lock()
-                    .expect("responses lock")
+                    .expect("chat requests lock")
+                    .push(request);
+                self.upstream_responses
+                    .lock()
+                    .expect("upstream responses lock")
+                    .pop_front()
+                    .expect("stub response")
+            })
+        }
+
+        fn send_responses<'a>(
+            &'a self,
+            request: UpstreamResponsesRequest,
+        ) -> crate::openai::ClientFuture<'a> {
+            Box::pin(async move {
+                self.responses_requests
+                    .lock()
+                    .expect("responses requests lock")
+                    .push(request);
+                self.upstream_responses
+                    .lock()
+                    .expect("upstream responses lock")
                     .pop_front()
                     .expect("stub response")
             })
@@ -803,18 +1020,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_observation_logs_sanitized_auth_shape_without_body_capture() {
+    async fn responses_preserves_upstream_success_and_logs_sanitized_metadata() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_SUCCESS");
+        env_guard.set("sk-upstream-secret");
         let tempdir = tempfile::tempdir().expect("tempdir");
         let log_path = tempdir.path().join("events.jsonl");
         let mut config = AppConfig::default();
         config.logging.enabled = true;
         config.logging.path = log_path.clone();
         config.logging.log_bodies = false;
+        config.openai.api_key_env = "PHASE1_OPENAI_API_KEY_RESPONSES_SUCCESS".to_string();
         let mut writer = EventLogWriter::spawn(&log_path, true)
             .await
             .expect("event writer");
-        let app =
-            build_router_with_client(config, writer.handle(), Arc::new(StubClient::default()));
+        let stub = Arc::new(StubClient::with_responses(vec![Ok(UpstreamResponse {
+            status: StatusCode::OK,
+            headers: test_headers(&[
+                ("content-type", "application/json"),
+                ("x-request-id", "resp_req_123"),
+            ]),
+            body: br#"{"id":"resp_123","output_text":"hello"}"#.to_vec(),
+        })]));
+        let app = build_router_with_client(config, writer.handle(), stub.clone());
+        let request_body = br#"{"model":"gpt-5","input":"hello","token":"body-secret"}"#.to_vec();
 
         let response = app
             .oneshot(
@@ -825,20 +1053,41 @@ mod tests {
                     .header("authorization", "Bearer codex-secret")
                     .header("cookie", "sessionid=session-secret")
                     .header("x-api-key", "sk-body-adjacent-secret")
-                    .body(Body::from(
-                        br#"{"model":"gpt-5","input":"hello","token":"body-secret"}"#.to_vec(),
-                    ))
+                    .body(Body::from(request_body.clone()))
                     .expect("request"),
             )
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("resp_req_123")
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let json: Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(json["error"]["type"], "not_implemented");
+        assert_eq!(body.as_ref(), br#"{"id":"resp_123","output_text":"hello"}"#);
+
+        let upstream_request = stub.first_responses_request();
+        assert_eq!(upstream_request.api_key, "sk-upstream-secret");
+        assert_eq!(
+            upstream_request
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(upstream_request.headers.get("authorization").is_none());
+        assert_eq!(upstream_request.body, request_body);
+        let forwarded_json: Value =
+            serde_json::from_slice(&upstream_request.body).expect("forwarded json");
+        assert_eq!(forwarded_json["model"], "gpt-5");
+        assert_eq!(forwarded_json["input"], "hello");
+        assert!(forwarded_json.get("stream").is_none());
 
         writer.shutdown().await.expect("writer shutdown");
         let log_text = fs::read_to_string(&log_path).expect("read log");
@@ -846,6 +1095,7 @@ mod tests {
         assert!(!log_text.contains("session-secret"));
         assert!(!log_text.contains("sk-body-adjacent-secret"));
         assert!(!log_text.contains("body-secret"));
+        assert!(!log_text.contains("sk-upstream-secret"));
 
         let records = read_event_records(&log_path);
         let request = records
@@ -858,7 +1108,19 @@ mod tests {
             .expect("responses response event");
 
         assert_eq!(request["data"]["path"], "/v1/responses");
-        assert_eq!(request["data"]["target"], "marsala_local");
+        assert_eq!(request["data"]["target"], "upstream");
+        assert_eq!(
+            request["data"]["upstream_url"],
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            request["data"]["api_key_env"],
+            "PHASE1_OPENAI_API_KEY_RESPONSES_SUCCESS"
+        );
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization"],
+            "[redacted]"
+        );
         assert_eq!(request["data"]["body_logging"], "disabled");
         assert!(request["data"].get("body").is_none());
         assert_eq!(request["data"]["auth_shape"]["authorization_present"], true);
@@ -868,10 +1130,184 @@ mod tests {
         );
         assert_eq!(request["data"]["auth_shape"]["cookie_present"], true);
         assert_eq!(request["data"]["auth_shape"]["x_api_key_present"], true);
-        assert_eq!(response["data"]["status"], 501);
+        assert_eq!(request["data"]["stream"], false);
+        assert_eq!(response["data"]["status"], 200);
+        assert_eq!(response["data"]["source"], "upstream");
         assert_eq!(
             request["data"]["request_id"],
             response["data"]["request_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_preserves_upstream_4xx_and_5xx_bodies() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_ERRORS");
+        env_guard.set("sk-upstream-secret");
+        let app = build_test_app(
+            Arc::new(StubClient::with_responses(vec![
+                Ok(UpstreamResponse {
+                    status: StatusCode::UNAUTHORIZED,
+                    headers: test_headers(&[("content-type", "application/json")]),
+                    body: br#"{"error":{"message":"bad key"}}"#.to_vec(),
+                }),
+                Ok(UpstreamResponse {
+                    status: StatusCode::BAD_GATEWAY,
+                    headers: test_headers(&[("content-type", "application/json")]),
+                    body: br#"{"error":{"message":"upstream overloaded"}}"#.to_vec(),
+                }),
+            ])),
+            false,
+            "PHASE1_OPENAI_API_KEY_RESPONSES_ERRORS",
+        );
+
+        let response_4xx = app
+            .clone()
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello"}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response_4xx.status(), StatusCode::UNAUTHORIZED);
+        let body_4xx = axum::body::to_bytes(response_4xx.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body_4xx.as_ref(), br#"{"error":{"message":"bad key"}}"#);
+
+        let response_5xx = app
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello"}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response_5xx.status(), StatusCode::BAD_GATEWAY);
+        let body_5xx = axum::body::to_bytes(response_5xx.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            body_5xx.as_ref(),
+            br#"{"error":{"message":"upstream overloaded"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_returns_configuration_error_for_missing_api_key() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_MISSING");
+        env_guard.remove();
+        let stub = Arc::new(StubClient::default());
+        let app = build_test_app(
+            stub.clone(),
+            false,
+            "PHASE1_OPENAI_API_KEY_RESPONSES_MISSING",
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer inbound-should-not-be-used")
+                    .body(Body::from(br#"{"model":"gpt-5","input":"hello"}"#.to_vec()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(stub.request_count(), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["type"], "configuration_error");
+        assert!(json["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("PHASE1_OPENAI_API_KEY_RESPONSES_MISSING"));
+    }
+
+    #[tokio::test]
+    async fn responses_rejects_stream_true_without_upstream_call_and_logs_local_only() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_STREAM");
+        env_guard.set("sk-upstream-secret");
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut config = AppConfig::default();
+        config.logging.enabled = true;
+        config.logging.path = log_path.clone();
+        config.logging.log_bodies = false;
+        config.openai.api_key_env = "PHASE1_OPENAI_API_KEY_RESPONSES_STREAM".to_string();
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let stub = Arc::new(StubClient::default());
+        let app = build_router_with_client(config, writer.handle(), stub.clone());
+
+        let response = app
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello","stream":true}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stub.request_count(), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["type"], "unsupported_streaming");
+
+        writer.shutdown().await.expect("writer shutdown");
+        let records = read_event_records(&log_path);
+        let request = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_request")
+            .expect("request event");
+        let response = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_response")
+            .expect("response event");
+
+        assert_eq!(request["data"]["target"], "marsala_local");
+        assert_eq!(request["data"]["stream"], true);
+        assert!(request["data"].get("upstream_headers").is_none());
+        assert!(request["data"].get("upstream_url").is_none());
+        assert!(request["data"].get("api_key_env").is_none());
+        assert_eq!(response["data"]["source"], "marsala_local");
+        assert_eq!(
+            request["data"]["request_id"],
+            response["data"]["request_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_url_construction_avoids_duplicate_v1_segment() {
+        let mut config = AppConfig::default();
+        config.openai.base_url = "http://upstream.example/v1/".to_string();
+        let state = AppState {
+            config: Arc::new(config),
+            event_log: EventLogHandle::disabled(),
+            openai_client: Arc::new(StubClient::default()),
+        };
+        let request_id = "test-request".to_string();
+
+        emit_responses_request_log(
+            &state,
+            &request_id,
+            &HeaderMap::new(),
+            &Some("application/json".to_string()),
+            Some(&ResponsesRequest {
+                stream: None,
+                extra: Map::new(),
+            }),
+            2,
+            "upstream",
+        );
+
+        assert_eq!(
+            responses_url(&state.config.openai.base_url),
+            "http://upstream.example/v1/responses"
         );
     }
 
@@ -1452,6 +1888,15 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    }
+
+    fn post_responses_request(body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .expect("request")

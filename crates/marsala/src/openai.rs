@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 
 const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const RESPONSES_PATH: &str = "/responses";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionsRequest {
@@ -35,12 +36,33 @@ impl ChatCompletionsRequest {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResponsesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl ResponsesRequest {
+    pub fn stream_requested(&self) -> bool {
+        self.stream.unwrap_or(false)
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).context("failed to serialize responses request")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamChatRequest {
+pub struct UpstreamRequest {
     pub api_key: String,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
+
+pub type UpstreamChatRequest = UpstreamRequest;
+pub type UpstreamResponsesRequest = UpstreamRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamResponse {
@@ -59,17 +81,19 @@ pub enum UpstreamError {
 pub type ClientFuture<'a> =
     Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + 'a>>;
 
-pub trait ChatCompletionsClient: Send + Sync {
+pub trait OpenAiCompatibleClient: Send + Sync {
     fn send_chat_completions<'a>(&'a self, request: UpstreamChatRequest) -> ClientFuture<'a>;
+
+    fn send_responses<'a>(&'a self, request: UpstreamResponsesRequest) -> ClientFuture<'a>;
 }
 
 #[derive(Clone)]
-pub struct ReqwestChatCompletionsClient {
+pub struct ReqwestOpenAiCompatibleClient {
     base_url: String,
     client: reqwest::Client,
 }
 
-impl ReqwestChatCompletionsClient {
+impl ReqwestOpenAiCompatibleClient {
     pub fn new(base_url: &str) -> Result<Self> {
         Self::with_timeout(base_url, DEFAULT_UPSTREAM_TIMEOUT)
     }
@@ -89,44 +113,61 @@ impl ReqwestChatCompletionsClient {
     pub fn chat_completions_url(&self) -> String {
         format!("{}{}", self.base_url, CHAT_COMPLETIONS_PATH)
     }
+
+    pub fn responses_url(&self) -> String {
+        format!("{}{}", self.base_url, RESPONSES_PATH)
+    }
+
+    async fn send_json_request(
+        &self,
+        url: String,
+        request: UpstreamRequest,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let default_accept = !request.headers.contains_key(ACCEPT);
+        let mut builder = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {}", request.api_key));
+
+        for (name, value) in &request.headers {
+            if name != AUTHORIZATION {
+                builder = builder.header(name, value);
+            }
+        }
+
+        if default_accept {
+            builder = builder.header(ACCEPT, "application/json");
+        }
+
+        let response = builder
+            .body(request.body)
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let status = StatusCode::from_u16(response.status().as_u16()).map_err(|error| {
+            UpstreamError::InvalidResponse(format!("invalid upstream status code: {error}"))
+        })?;
+        let headers = filter_upstream_response_headers(response.headers());
+        let body = response.bytes().await.map_err(map_body_error)?.to_vec();
+
+        Ok(UpstreamResponse {
+            status,
+            headers,
+            body,
+        })
+    }
 }
 
-impl ChatCompletionsClient for ReqwestChatCompletionsClient {
+impl OpenAiCompatibleClient for ReqwestOpenAiCompatibleClient {
     fn send_chat_completions<'a>(&'a self, request: UpstreamChatRequest) -> ClientFuture<'a> {
         Box::pin(async move {
-            let default_accept = !request.headers.contains_key(ACCEPT);
-            let mut builder = self
-                .client
-                .post(self.chat_completions_url())
-                .header(AUTHORIZATION, format!("Bearer {}", request.api_key));
-
-            for (name, value) in &request.headers {
-                if name != AUTHORIZATION {
-                    builder = builder.header(name, value);
-                }
-            }
-
-            if default_accept {
-                builder = builder.header(ACCEPT, "application/json");
-            }
-
-            let response = builder
-                .body(request.body)
-                .send()
+            self.send_json_request(self.chat_completions_url(), request)
                 .await
-                .map_err(map_send_error)?;
-            let status = StatusCode::from_u16(response.status().as_u16()).map_err(|error| {
-                UpstreamError::InvalidResponse(format!("invalid upstream status code: {error}"))
-            })?;
-            let headers = filter_upstream_response_headers(response.headers());
-            let body = response.bytes().await.map_err(map_body_error)?.to_vec();
-
-            Ok(UpstreamResponse {
-                status,
-                headers,
-                body,
-            })
         })
+    }
+
+    fn send_responses<'a>(&'a self, request: UpstreamResponsesRequest) -> ClientFuture<'a> {
+        Box::pin(async move { self.send_json_request(self.responses_url(), request).await })
     }
 }
 
@@ -212,12 +253,16 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_client_avoids_duplicate_v1_segment() {
-        let client =
-            ReqwestChatCompletionsClient::new("https://api.openai.com/v1").expect("reqwest client");
+        let client = ReqwestOpenAiCompatibleClient::new("https://api.openai.com/v1")
+            .expect("reqwest client");
 
         assert_eq!(
             client.chat_completions_url(),
             "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            client.responses_url(),
+            "https://api.openai.com/v1/responses"
         );
     }
 
@@ -281,7 +326,7 @@ mod tests {
 
         let (base_url, _server) =
             spawn_axum_server(Router::new().route("/v1/chat/completions", post(handler))).await;
-        let client = ReqwestChatCompletionsClient::new(&base_url).expect("reqwest client");
+        let client = ReqwestOpenAiCompatibleClient::new(&base_url).expect("reqwest client");
 
         let response = client
             .send_chat_completions(UpstreamChatRequest {
@@ -343,6 +388,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reqwest_client_posts_to_configured_responses_endpoint() {
+        async fn handler(headers: HeaderMap, request: Request) -> impl IntoResponse {
+            let auth = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let path = request.uri().path().to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("request body");
+
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", HeaderValue::from_static("application/json")),
+                    ("x-request-id", HeaderValue::from_static("resp_req_123")),
+                ],
+                serde_json::json!({
+                    "path": path,
+                    "authorization": auth,
+                    "body": serde_json::from_slice::<Value>(&body).expect("json body"),
+                })
+                .to_string(),
+            )
+        }
+
+        let (base_url, _server) =
+            spawn_axum_server(Router::new().route("/v1/responses", post(handler))).await;
+        let client = ReqwestOpenAiCompatibleClient::new(&base_url).expect("reqwest client");
+
+        let response = client
+            .send_responses(UpstreamResponsesRequest {
+                api_key: "sk-test-secret".to_string(),
+                headers: request_headers(&[("content-type", "application/json")]),
+                body: br#"{"model":"gpt-5","input":"hi","metadata":{"trace":"abc"}}"#.to_vec(),
+            })
+            .await
+            .expect("upstream response");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("resp_req_123")
+        );
+
+        let json: Value = serde_json::from_slice(&response.body).expect("response json");
+        assert_eq!(json["path"], "/v1/responses");
+        assert_eq!(json["authorization"], "Bearer sk-test-secret");
+        assert_eq!(json["body"]["model"], "gpt-5");
+        assert_eq!(json["body"]["metadata"]["trace"], "abc");
+    }
+
+    #[tokio::test]
     async fn reqwest_client_maps_upstream_timeout() {
         async fn handler() -> impl IntoResponse {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -356,7 +458,7 @@ mod tests {
         let (base_url, _server) =
             spawn_axum_server(Router::new().route("/v1/chat/completions", post(handler))).await;
         let client =
-            ReqwestChatCompletionsClient::with_timeout(&base_url, Duration::from_millis(50))
+            ReqwestOpenAiCompatibleClient::with_timeout(&base_url, Duration::from_millis(50))
                 .expect("reqwest client");
 
         let error = client
@@ -389,7 +491,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let client = ReqwestChatCompletionsClient::new(&format!("http://{address}/v1"))
+        let client = ReqwestOpenAiCompatibleClient::new(&format!("http://{address}/v1"))
             .expect("reqwest client");
 
         let error = client
