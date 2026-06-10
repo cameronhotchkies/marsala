@@ -186,7 +186,7 @@ Acceptance gates:
 
 Goal: route real Codex traffic through Marsala with explicit proxy behavior and observable tunnel/intercept outcomes.
 
-Status: tunnel baseline complete for normal Codex. `CONNECT` metadata is logged with target host/port and action. Allowlisted MITM currently selects candidates but returns `mitm_unimplemented` until TLS termination is implemented.
+Status: tunnel baseline complete for normal Codex. `CONNECT` metadata is logged with target host/port and action. Allowlisted MITM can now terminate downstream TLS for exact configured hosts, emit sanitized `mitm_tls` metadata, and record the first decrypted HTTP/1.1 request metadata when available. Upstream MITM forwarding is still the active blocker.
 
 Scope:
 
@@ -218,9 +218,10 @@ Scope:
   - CA export and trust setup with `CODEX_CA_CERTIFICATE`
   - per-host certificate generation for exact allowlisted hosts
   - explicit failure behavior when trust is missing
-- Terminate downstream TLS for allowlisted hosts and log handshake metadata without secrets.
-- Parse enough decrypted HTTP to record method, redacted path, auth shape, and status.
-- Add upstream forwarding only after TLS termination and request visibility are proven.
+- [x] Terminate downstream TLS for allowlisted hosts and log handshake metadata without secrets.
+- [x] Parse enough decrypted HTTP to record method, redacted path, and auth shape.
+- [ ] Forward decrypted HTTP/1.1 requests upstream and stream responses back without logging bodies or credentials.
+- [ ] Record upstream status metadata after forwarding is implemented.
 - Record TLS transport details that affect feasibility: `CONNECT`, SNI, ALPN, HTTP/2, and certificate pinning behavior.
 - Keep interception allowlisted and opt-in.
 

@@ -110,13 +110,15 @@ Completed implementation slices:
 2. `.gitignore` protection for generated certs and keys.
 3. Config validation for exact host allowlists.
 4. Proxy runtime `CONNECT` decision logging.
-5. Allowlisted MITM candidates currently return `mitm_unimplemented`; non-allowlisted targets tunnel.
+5. Downstream TLS termination for exact allowlisted hosts.
+6. Sanitized `mitm_tls` and first decrypted HTTP/1.1 `mitm_request` metadata.
+7. Non-allowlisted targets tunnel unchanged.
 
 Next implementation slice:
 
-1. Load the generated CA keypair.
-2. Generate per-host leaf certificates for `chatgpt.com` and `ab.chatgpt.com`.
-3. Add downstream TLS termination for allowlisted hosts.
-4. Emit `mitm_tls` handshake metadata.
-5. Parse one decrypted HTTP/1.1 request and emit sanitized `mitm_request` metadata, or record ALPN/HTTP2/WebSocket as the next blocker.
+1. Open an upstream TLS connection to the exact allowlisted target host with normal certificate verification.
+2. Forward the decrypted HTTP/1.1 request upstream while preserving auth/session headers and stripping proxy/hop-by-hop headers correctly.
+3. Stream the upstream response back downstream without buffering bodies or logging body/chunk content.
+4. Emit sanitized `mitm_response` metadata with status and timing.
+5. Explicitly reject or record unsupported HTTP/2 and WebSocket traffic without claiming full Codex MITM.
 6. Validate with normal Codex before adding body capture, rewrite, or broad forwarding claims.
