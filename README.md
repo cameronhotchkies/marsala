@@ -2,7 +2,7 @@
 
 Marsala currently ships a local-first Rust service skeleton with non-streaming OpenAI-shaped chat completions and Responses forwarding, plus streaming passthrough for `POST /v1/responses` with `stream=true`. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, `POST /v1/chat/completions`, and `POST /v1/responses`, writes JSONL events, and shuts down on `Ctrl-C`.
 
-That explicit gateway remains supported as a compatibility path for Codex custom providers. The proxy probe verifies routing, proxy env behavior, visible upstream hosts/endpoints, auth-shape redaction, and safe logging defaults. It does not implement body capture, stream capture, MITM, or TLS decryption.
+That explicit gateway remains supported as a compatibility path for Codex custom providers. The proxy/MITM path is the mainline for normal ChatGPT-backed Codex: non-allowlisted HTTPS is tunneled with metadata logging, and exact allowlisted hosts can be TLS-terminated to log sanitized handshake and first HTTP/1.1 request metadata. Marsala still does not implement request/response body capture, stream chunk capture, upstream MITM forwarding, HTTP/2 MITM, or WebSocket MITM.
 
 ## Prerequisites
 
