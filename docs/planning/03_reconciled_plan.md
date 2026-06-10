@@ -21,11 +21,13 @@ Later promise:
 
 ## Key Decisions
 
-- The current committed non-streaming `/v1/chat/completions` proxy stays as a compatibility scaffold, not the product-defining baseline.
-- The next milestone is Codex traffic acquisition and interception viability.
-- The first internal model can stay OpenAI-shaped while Codex routing details are still being discovered.
-- Marsala does not claim to intercept Codex traffic today; that is the baseline use case to prove next.
-- Proxy and CLI interception work moves ahead of streaming, rewrite, and tool-capture semantics.
+- The explicit OpenAI-shaped gateway (`/v1/chat/completions` and `/v1/responses`) stays as a compatibility scaffold and fixture source, not the product-defining baseline.
+- The mainline product path is allowlisted MITM for normal Codex traffic routed through Marsala with proxy environment variables.
+- A normal ChatGPT-backed Codex run has been observed through Marsala's proxy as HTTPS `CONNECT` traffic to `chatgpt.com` and `ab.chatgpt.com`; those are the current primary MITM targets.
+- `api.openai.com` remains relevant for the API-key gateway and API-billed Codex/custom-provider experiments, but it is not the observed normal subscription-backed Codex host.
+- Codex custom-provider `requires_openai_auth=true` plus inbound auth passthrough was tested against `https://api.openai.com/v1/responses` and reached upstream, but upstream returned `401 Unauthorized`. Treat that path as a failed shortcut unless MITM discovers a different subscription-backed upstream.
+- Marsala does not claim decrypted Codex interception yet. Current normal Codex proxy success is tunneled metadata only until TLS termination lands.
+- Proxy and allowlisted MITM work move ahead of rewrite, tool-capture semantics, and broad provider expansion.
 - Streaming is observed and preserved before any streaming mutation.
 - Logging is local and useful, but auth headers, proxy credentials, and known secrets are redacted.
 - Tool-call capture starts with complete non-streaming calls, then moves to streamed reconstruction.
@@ -33,13 +35,15 @@ Later promise:
 
 ## Must-Verify Unknowns
 
-- [ ] Codex custom base URL support: whether Codex can be pointed directly at Marsala with a base URL, host override, or equivalent documented/undocumented setting.
-- [ ] Proxy env behavior: exact precedence and fallback behavior for `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, including whether Codex ignores any of them.
-- [ ] Actual hosts and endpoints: the concrete upstream hostnames, ports, and request paths Codex uses in the baseline workflow.
-- [ ] API surface: whether Codex uses the Responses API, chat completions, or another endpoint family on the baseline path.
+- [x] Codex custom base URL support: Codex can be pointed at Marsala as a custom Responses provider.
+- [x] Proxy env baseline: normal Codex traffic can be routed through Marsala with `HTTPS_PROXY`.
+- [x] Initial normal Codex hosts: observed `chatgpt.com:443` and `ab.chatgpt.com:443` through `CONNECT`; unrelated `github.com:443` also appears and must not be MITM'd by default.
+- [x] Inbound auth shortcut result: ChatGPT/Codex auth forwarded to `api.openai.com/v1/responses` returns `401 Unauthorized`.
+- [ ] Decrypted normal Codex endpoint paths: still unknown until allowlisted MITM TLS termination succeeds.
+- [ ] API surface on normal Codex path: whether decrypted traffic uses Responses, ChatGPT backend APIs, WebSocket, or another endpoint family.
 - [ ] Streaming shape: framing, chunk ordering, completion markers, and cancellation behavior Marsala must preserve.
 - [ ] Auth and session forwarding: which inbound auth headers, bearer tokens, cookies, session headers, or device identifiers must pass through unchanged, and what must always be redacted.
-- [ ] TLS, MITM, and cert trust requirements: whether inspectable interception needs `CONNECT` handling only, full TLS interception, local CA trust, HTTP/2 handling, ALPN/SNI awareness, or tolerance for certificate pinning.
+- [ ] TLS, MITM, and cert trust requirements: whether `CODEX_CA_CERTIFICATE` is sufficient, and whether Codex requires HTTP/2, WebSocket, ALPN behavior, or has certificate pinning.
 
 ## Recommended Defaults
 
@@ -140,7 +144,9 @@ Non-goals:
 
 ## Phase 1: Codex Traffic Acquisition Baseline
 
-Goal: prove how Codex traffic can be routed through Marsala safely and observably enough to support the real baseline use case.
+Status: partially complete. Normal Codex can be routed through Marsala's proxy and completes successfully when tunneled. Decrypted payload inspection is not complete.
+
+Goal: route normal ChatGPT-backed Codex traffic through Marsala and identify the exact allowlisted hosts needed for payload inspection.
 
 Scope:
 
@@ -149,6 +155,8 @@ Scope:
   - whether Codex uses direct HTTPS, `CONNECT` tunneling, or another transport shape
   - whether explicit base URL or host overrides participate in the traffic path
 - Enumerate the concrete upstream hosts and endpoint paths Codex uses in the baseline workflow.
+  - Current observed hosts: `chatgpt.com` and `ab.chatgpt.com`.
+  - `github.com` may appear during a run and must remain tunneled unless explicitly in scope.
 - Determine the streaming response shape Marsala must preserve:
   - SSE framing
   - chunk boundaries and ordering expectations
@@ -178,6 +186,8 @@ Acceptance gates:
 
 Goal: route real Codex traffic through Marsala with explicit proxy behavior and observable tunnel/intercept outcomes.
 
+Status: tunnel baseline complete for normal Codex. `CONNECT` metadata is logged with target host/port and action. Allowlisted MITM currently selects candidates but returns `mitm_unimplemented` until TLS termination is implemented.
+
 Scope:
 
 - Proxy listener, for example `localhost:8788`.
@@ -197,27 +207,29 @@ Acceptance gates:
 - The auth forwarding policy for routed/proxied Codex traffic is implemented without storing raw credentials.
 - Non-LLM traffic is not inspected by default.
 
-## Phase 3: Interception Viability And Trust Requirements
+## Phase 3: Allowlisted MITM For Normal Codex
 
-Goal: determine whether Codex payload interception is possible, required, and supportable on the baseline path.
+Goal: decrypt and forward only allowlisted normal Codex traffic, starting with `chatgpt.com` and `ab.chatgpt.com`, while leaving unrelated HTTPS traffic tunneled.
 
 Scope:
 
-- Decide whether the validated Codex path can be satisfied by base URL routing, proxying, or requires allowlisted MITM.
-- If payload interception is required, spike the minimum trust path:
+- Implement and validate the trust path:
   - local CA generation
-  - CA print/export commands
-  - trust setup documentation
-  - per-host certificate generation
+  - CA export and trust setup with `CODEX_CA_CERTIFICATE`
+  - per-host certificate generation for exact allowlisted hosts
   - explicit failure behavior when trust is missing
+- Terminate downstream TLS for allowlisted hosts and log handshake metadata without secrets.
+- Parse enough decrypted HTTP to record method, redacted path, auth shape, and status.
+- Add upstream forwarding only after TLS termination and request visibility are proven.
 - Record TLS transport details that affect feasibility: `CONNECT`, SNI, ALPN, HTTP/2, and certificate pinning behavior.
 - Keep interception allowlisted and opt-in.
 
 Acceptance gates:
 
-- The plan states clearly whether Marsala can inspect Codex payloads today, or only tunnel them, with evidence.
-- Any requirement for local CA trust or MITM is recorded with exact setup steps and failure modes.
-- The concrete host allowlist and transport constraints for inspectable traffic are documented.
+- Normal Codex run produces `mitm_tls` and then `mitm_request` metadata for `chatgpt.com` or `ab.chatgpt.com`.
+- Logs contain no raw bearer token, cookie, request body, response body, or stream chunk content by default.
+- Non-allowlisted HTTPS targets, including `github.com`, still tunnel and do not produce decrypted metadata.
+- Any requirement for local CA trust is recorded with exact setup steps and failure modes.
 - No doc claims inspectable Codex interception unless this phase has been proven.
 
 ## Phase 4: Logging And Redaction Hardening

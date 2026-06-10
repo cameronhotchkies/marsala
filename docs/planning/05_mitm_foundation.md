@@ -1,6 +1,6 @@
 # MITM Foundation Plan
 
-Status: planned foundation. Marsala does not decrypt HTTPS traffic yet.
+Status: active mainline. Marsala can generate a local CA and select allowlisted `CONNECT` targets, but it does not decrypt HTTPS traffic yet.
 
 ## Decision
 
@@ -57,8 +57,14 @@ Trust guidance for the next implementation slice:
 
 Target hosts:
 
-- `api.openai.com:443`
 - `chatgpt.com:443`
+- `ab.chatgpt.com:443`
+
+Secondary/API-key target:
+
+- `api.openai.com:443`
+
+Normal ChatGPT-backed Codex has been observed tunneling to `chatgpt.com` and `ab.chatgpt.com`. `api.openai.com` is the API-billed/custom-provider path and is not the current mainline for subscription-backed Codex.
 
 Flow:
 
@@ -83,7 +89,7 @@ Flow:
 
 Success criterion for the first steel thread:
 
-- A normal Codex run with `HTTPS_PROXY=http://127.0.0.1:8788` and `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem` produces `mitm_request` metadata for an allowlisted host, including visible method/path/status, with no body or secret material in `logs/events.jsonl`.
+- A normal Codex run with `HTTPS_PROXY=http://127.0.0.1:8788` and `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem` produces `mitm_request` metadata for `chatgpt.com` or `ab.chatgpt.com`, including visible method/path/status, with no body or secret material in `logs/events.jsonl`.
 
 ## Blockers And Risks
 
@@ -98,18 +104,19 @@ Success criterion for the first steel thread:
 
 ## Next Code Slice
 
-Smallest implementation slice after this foundation:
+Completed implementation slices:
 
-1. Add dependencies: `rcgen`, direct `rustls`, `tokio-rustls`, `hyper`, `hyper-util`, and `http-body-util` as needed.
-2. Add `marsala mitm ca init` or equivalent subcommand to create the local CA only if files do not already exist.
-3. Add `marsala mitm ca print` or equivalent export helper that prints the CA certificate path and trust env examples.
-4. Add unit tests for CA file creation permissions, no overwrite by default, and PEM parseability.
-5. Keep proxy behavior unchanged until CA generation/export is proven.
+1. CA generation with `marsala mitm ca init`.
+2. `.gitignore` protection for generated certs and keys.
+3. Config validation for exact host allowlists.
+4. Proxy runtime `CONNECT` decision logging.
+5. Allowlisted MITM candidates currently return `mitm_unimplemented`; non-allowlisted targets tunnel.
 
-Second implementation slice:
+Next implementation slice:
 
-1. Add `CONNECT` decision logic: tunnel unless enabled and exact host allowlisted.
-2. Add downstream TLS termination for one allowlisted host with generated leaf certs.
-3. Add upstream TLS connection and HTTP/1.1 forwarding.
-4. Emit `mitm_request` metadata with sanitized method/path/status.
-5. Validate with Codex before adding body capture, rewrite, or HTTP/2 claims.
+1. Load the generated CA keypair.
+2. Generate per-host leaf certificates for `chatgpt.com` and `ab.chatgpt.com`.
+3. Add downstream TLS termination for allowlisted hosts.
+4. Emit `mitm_tls` handshake metadata.
+5. Parse one decrypted HTTP/1.1 request and emit sanitized `mitm_request` metadata, or record ALPN/HTTP2/WebSocket as the next blocker.
+6. Validate with normal Codex before adding body capture, rewrite, or broad forwarding claims.
