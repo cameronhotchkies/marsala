@@ -174,18 +174,18 @@ async fn follow_log_file(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<()> {
-    let mut follower = LogFollower::with_follow_start(path, follow_start);
+    let mut follower = EventLogFollower::with_follow_start(path, follow_start);
 
     loop {
         let events = follower.poll()?;
 
         for event in events {
             match event {
-                FollowEvent::Line(line) => {
+                EventLogFollowEvent::Line(line) => {
                     write!(stdout, "{line}")?;
                     stdout.flush()?;
                 }
-                FollowEvent::WaitingForFile(path) => {
+                EventLogFollowEvent::WaitingForFile(path) => {
                     writeln!(stderr, "waiting for log file: {}", path.display())?;
                     stderr.flush()?;
                 }
@@ -197,12 +197,12 @@ async fn follow_log_file(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FollowEvent {
+pub(crate) enum EventLogFollowEvent {
     Line(String),
     WaitingForFile(PathBuf),
 }
 
-struct LogFollower {
+pub(crate) struct EventLogFollower {
     path: PathBuf,
     reader: Option<BufReader<File>>,
     cursor: u64,
@@ -211,7 +211,11 @@ struct LogFollower {
     initial_open: Option<InitialOpen>,
 }
 
-impl LogFollower {
+impl EventLogFollower {
+    pub(crate) fn from_end(path: PathBuf) -> Self {
+        Self::with_initial_open(path, Some(InitialOpen::StartAtEnd))
+    }
+
     #[cfg(test)]
     fn new(path: PathBuf, start_at_end_on_first_open: bool) -> Self {
         let initial_open = start_at_end_on_first_open.then_some(InitialOpen::StartAtEnd);
@@ -239,7 +243,7 @@ impl LogFollower {
         }
     }
 
-    fn poll(&mut self) -> Result<Vec<FollowEvent>> {
+    pub(crate) fn poll(&mut self) -> Result<Vec<EventLogFollowEvent>> {
         let mut events = Vec::new();
 
         loop {
@@ -247,7 +251,6 @@ impl LogFollower {
                 match self.open_current_path()? {
                     Some((mut reader, file_state)) => {
                         self.cursor = match self.initial_open.take() {
-                            #[cfg(test)]
                             Some(InitialOpen::StartAtEnd) => file_state.len,
                             Some(InitialOpen::ResumeFromSnapshot { file_id, cursor })
                                 if file_state.id == file_id =>
@@ -267,7 +270,7 @@ impl LogFollower {
                     None => {
                         self.initial_open = None;
                         if self.report_waiting {
-                            events.push(FollowEvent::WaitingForFile(self.path.clone()));
+                            events.push(EventLogFollowEvent::WaitingForFile(self.path.clone()));
                             self.report_waiting = false;
                         }
                         return Ok(events);
@@ -282,7 +285,7 @@ impl LogFollower {
             };
             if read > 0 {
                 self.cursor += read as u64;
-                events.push(FollowEvent::Line(line));
+                events.push(EventLogFollowEvent::Line(line));
                 continue;
             }
 
@@ -312,7 +315,7 @@ impl LogFollower {
                     self.current_file_id = None;
                     self.cursor = 0;
                     if self.report_waiting {
-                        events.push(FollowEvent::WaitingForFile(self.path.clone()));
+                        events.push(EventLogFollowEvent::WaitingForFile(self.path.clone()));
                         self.report_waiting = false;
                     }
                     return Ok(events);
@@ -376,12 +379,8 @@ fn read_tail_snapshot(path: &Path, lines: usize) -> Result<TailSnapshot> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitialOpen {
-    #[cfg(test)]
     StartAtEnd,
-    ResumeFromSnapshot {
-        file_id: FileId,
-        cursor: u64,
-    },
+    ResumeFromSnapshot { file_id: FileId, cursor: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,18 +515,18 @@ mod tests {
     fn follower_waits_once_and_reads_new_file_from_start() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let path = tempdir.path().join("events.jsonl");
-        let mut follower = LogFollower::new(path.clone(), true);
+        let mut follower = EventLogFollower::new(path.clone(), true);
 
         assert_eq!(
             follower.poll().expect("initial poll"),
-            vec![FollowEvent::WaitingForFile(path.clone())]
+            vec![EventLogFollowEvent::WaitingForFile(path.clone())]
         );
         assert!(follower.poll().expect("repeat poll").is_empty());
 
         fs::write(&path, "first\n").expect("write new log");
         assert_eq!(
             follower.poll().expect("poll after creation"),
-            vec![FollowEvent::Line("first\n".to_string())]
+            vec![EventLogFollowEvent::Line("first\n".to_string())]
         );
     }
 
@@ -537,7 +536,7 @@ mod tests {
         let path = tempdir.path().join("events.jsonl");
         fs::write(&path, "old\n").expect("write initial log");
 
-        let mut follower = LogFollower::new(path.clone(), true);
+        let mut follower = EventLogFollower::new(path.clone(), true);
         assert!(follower.poll().expect("initial poll").is_empty());
 
         let mut file = fs::OpenOptions::new()
@@ -548,7 +547,7 @@ mod tests {
 
         assert_eq!(
             follower.poll().expect("poll after append"),
-            vec![FollowEvent::Line("new\n".to_string())]
+            vec![EventLogFollowEvent::Line("new\n".to_string())]
         );
     }
 
@@ -567,10 +566,10 @@ mod tests {
             .expect("open log for append");
         file.write_all(b"new\n").expect("append log");
 
-        let mut follower = LogFollower::with_follow_start(path.clone(), snapshot.follow_start);
+        let mut follower = EventLogFollower::with_follow_start(path.clone(), snapshot.follow_start);
         assert_eq!(
             follower.poll().expect("poll after append"),
-            vec![FollowEvent::Line("new\n".to_string())]
+            vec![EventLogFollowEvent::Line("new\n".to_string())]
         );
     }
 
@@ -581,7 +580,7 @@ mod tests {
         let rotated = tempdir.path().join("events.jsonl.1");
         fs::write(&path, "old\n").expect("write initial log");
 
-        let mut follower = LogFollower::new(path.clone(), true);
+        let mut follower = EventLogFollower::new(path.clone(), true);
         assert!(follower.poll().expect("initial poll").is_empty());
 
         fs::rename(&path, &rotated).expect("rotate log");
@@ -589,7 +588,7 @@ mod tests {
 
         assert_eq!(
             follower.poll().expect("poll after recreation"),
-            vec![FollowEvent::Line("new\n".to_string())]
+            vec![EventLogFollowEvent::Line("new\n".to_string())]
         );
     }
 
@@ -604,10 +603,10 @@ mod tests {
         fs::rename(&path, &rotated).expect("rotate log");
         fs::write(&path, "new\n").expect("write replacement log");
 
-        let mut follower = LogFollower::with_follow_start(path.clone(), snapshot.follow_start);
+        let mut follower = EventLogFollower::with_follow_start(path.clone(), snapshot.follow_start);
         assert_eq!(
             follower.poll().expect("poll replacement"),
-            vec![FollowEvent::Line("new\n".to_string())]
+            vec![EventLogFollowEvent::Line("new\n".to_string())]
         );
     }
 
@@ -617,14 +616,14 @@ mod tests {
         let path = tempdir.path().join("events.jsonl");
         fs::write(&path, "one\ntwo\n").expect("write initial log");
 
-        let mut follower = LogFollower::new(path.clone(), true);
+        let mut follower = EventLogFollower::new(path.clone(), true);
         assert!(follower.poll().expect("initial poll").is_empty());
 
         fs::write(&path, "reset\n").expect("truncate and rewrite");
 
         assert_eq!(
             follower.poll().expect("poll after truncate"),
-            vec![FollowEvent::Line("reset\n".to_string())]
+            vec![EventLogFollowEvent::Line("reset\n".to_string())]
         );
     }
 
@@ -637,10 +636,10 @@ mod tests {
         assert!(snapshot.lines.is_empty());
         fs::write(&path, "first\n").expect("write new log");
 
-        let mut follower = LogFollower::with_follow_start(path.clone(), snapshot.follow_start);
+        let mut follower = EventLogFollower::with_follow_start(path.clone(), snapshot.follow_start);
         assert_eq!(
             follower.poll().expect("poll created log"),
-            vec![FollowEvent::Line("first\n".to_string())]
+            vec![EventLogFollowEvent::Line("first\n".to_string())]
         );
     }
 

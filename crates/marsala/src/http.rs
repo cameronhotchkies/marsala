@@ -12,13 +12,13 @@ use std::{
 use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{Query, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE, COOKIE},
         HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
     },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -36,6 +36,7 @@ use crate::{
         UpstreamAuthorization, UpstreamBodyStream, UpstreamChatRequest, UpstreamError,
         UpstreamResponsesRequest,
     },
+    ui::{self, UiEventFilter},
 };
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -65,6 +66,9 @@ fn build_router_with_client(
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/ui", get(ui_page))
+        .route("/ui/events/recent", get(ui_recent_events))
+        .route("/ui/events", get(ui_events))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .layer(middleware::from_fn_with_state(
@@ -82,6 +86,31 @@ async fn healthz() -> impl IntoResponse {
             service: "marsala",
         }),
     )
+}
+
+async fn ui_page() -> impl IntoResponse {
+    Html(ui::INTERCEPTION_UI_HTML)
+}
+
+async fn ui_recent_events(
+    State(state): State<AppState>,
+    Query(filter): Query<UiEventFilter>,
+) -> Response {
+    match ui::recent_events(&state.config.logging.path, &filter) {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read event log: {error:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn ui_events(
+    State(state): State<AppState>,
+    Query(filter): Query<UiEventFilter>,
+) -> impl IntoResponse {
+    ui::event_stream(state.config.logging.path.clone(), filter)
 }
 
 async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1310,6 +1339,89 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "marsala");
+    }
+
+    #[tokio::test]
+    async fn ui_route_serves_interception_dashboard() {
+        let app = build_router_with_client(
+            AppConfig::default(),
+            EventLogHandle::disabled(),
+            Arc::new(StubClient::default()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("content type")
+            .starts_with("text/html"));
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(html.contains("Marsala Interception"));
+        assert!(html.contains("/ui/events/recent"));
+        assert!(html.contains("new EventSource('/ui/events?'"));
+    }
+
+    #[tokio::test]
+    async fn ui_recent_events_returns_filtered_payload_summaries() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"timestamp":"2026-06-10T12:00:00Z","event_type":"mitm_request","data":{"target_host":"chatgpt.com","method":"GET","path":"/metadata","status":"forwarded"}}"#,
+                r#"{"timestamp":"2026-06-10T12:00:01Z","event_type":"mitm_payload","data":{"target_host":"chatgpt.com","method":"POST","path":"/backend-api/conversation","direction":"request","body_bytes":42,"preview_bytes":20,"truncated":true,"preview":"{\"message\":\"hello\"}"}}"#,
+                r#"{"timestamp":"2026-06-10T12:00:02Z","event_type":"mitm_payload","data":{"target_host":"api.openai.com","method":"POST","path":"/v1/responses","direction":"request","body_bytes":11,"preview":"{}"}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write log");
+        let mut config = AppConfig::default();
+        config.logging.path = log_path;
+        let app = build_router_with_client(
+            config,
+            EventLogHandle::disabled(),
+            Arc::new(StubClient::default()),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/ui/events/recent?lines=10&payloads_only=true&host=chatgpt&path_contains=conversation",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let events: Vec<Value> = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "mitm_payload");
+        assert_eq!(events[0]["category"], "payload");
+        assert_eq!(events[0]["target_host"], "chatgpt.com");
+        assert_eq!(events[0]["byte_summary"], "body=42B preview=20B");
+        assert_eq!(events[0]["truncated"], true);
+        assert_eq!(events[0]["preview"], "{\"message\":\"hello\"}");
     }
 
     #[tokio::test]

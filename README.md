@@ -25,6 +25,8 @@ cargo run -p marsala -- config print --all
 cargo run -p marsala -- logs tail --lines 20
 ```
 
+When Marsala is running, the live interception dashboard is served at `http://127.0.0.1:8787/ui`. It shows recent and live JSONL events from the configured event log with timeline filters, payload previews, and a detail pane.
+
 First-run smoke path:
 
 Terminal 1:
@@ -179,15 +181,21 @@ just mitm-codex
 
 Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, forwards decrypted HTTP/1.1 requests and HTTP/1.1 WebSocket upgrades to the same host:port over verified upstream TLS, tunnels WebSocket bytes after upstream `101 Switching Protocols`, and emits sanitized `mitm_request` and `mitm_response` metadata. If payload capture is enabled, Marsala also emits bounded `mitm_payload` and `mitm_websocket_frame` preview events. If Codex uses HTTP/2, a malformed or non-WebSocket upgrade, request-body streaming beyond bounded `Content-Length`, or a response body stalls beyond the steel-thread timeout, Marsala logs an explicit unsupported or timeout status instead of silently forwarding indefinitely.
 
-To inspect local allowlisted MITM payloads for a validation run, use the capture-enabled server command:
+To inspect local allowlisted MITM payloads for a validation run, use the browser dashboard with the capture-enabled server command:
 
 ```bash
-just mitm-serve-capture
-just mitm-codex
-just payload-logs
+just ui
 ```
 
-Capture is a local dev-tool feature: keep it off for routine runs, keep `mitm.allow_hosts` exact and narrow, and treat `logs/events.jsonl` as sensitive when enabled.
+Open `http://127.0.0.1:8787/ui`, then run traffic through the proxy:
+
+```bash
+just mitm-codex
+```
+
+The dashboard provides a two-pane live timeline and detail/payload preview view with category, host, path substring, payload-only, pause/resume, and clear controls. Raw JSONL remains available with `cargo run -p marsala -- logs tail --lines 80 --follow` or `just logs` when debugging the event file itself.
+
+Capture is a local dev-tool feature: keep it off for routine runs, keep `mitm.allow_hosts` exact and narrow, and treat `logs/events.jsonl` and the browser UI contents as sensitive when enabled.
 
 See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
 See [docs/planning/05_mitm_foundation.md](docs/planning/05_mitm_foundation.md) for the planned allowlisted MITM steel thread and Rust stack.
@@ -213,3 +221,11 @@ The container overrides a runtime setting:
 - `logs tail`: print the last JSONL entries, with optional `--follow`
 - `logs tail --follow`: prints one waiting message to stderr when `logs/events.jsonl` does not exist yet, then resumes on file creation or recreation
 - `mitm ca init`: generate `mitm.ca_cert_path` and `mitm.ca_key_path` without overwriting existing files
+
+## Interception UI
+
+- `GET /ui`: served browser dashboard for live event inspection
+- `GET /ui/events/recent`: recent transformed events from the configured JSONL event log
+- `GET /ui/events`: SSE feed of new transformed events from the configured JSONL event log
+
+The UI reads the same `logs/events.jsonl` stream as `logs tail`; it does not change API forwarding, proxy tunneling, or MITM behavior.

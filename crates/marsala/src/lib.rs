@@ -5,6 +5,7 @@ pub mod event_log;
 pub mod http;
 pub mod openai;
 pub mod proxy;
+pub mod ui;
 
 use std::{future::IntoFuture, sync::Once, time::Duration};
 
