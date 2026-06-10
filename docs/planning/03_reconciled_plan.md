@@ -76,6 +76,8 @@ port = 8788
 enabled = false
 default_action = "tunnel"
 allow_hosts = []
+ca_cert_path = "certs/marsala-ca.pem"
+ca_key_path = "certs/marsala-ca-key.pem"
 ```
 
 Docker default should be slightly safer:

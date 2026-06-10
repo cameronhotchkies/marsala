@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use config::{Config, Environment, File, FileFormat};
 use serde::{Deserialize, Serialize};
 
@@ -54,11 +54,13 @@ impl AppConfig {
                 .try_parsing(true),
         );
 
-        builder
+        let config: Self = builder
             .build()
             .context("failed to build configuration")?
             .try_deserialize()
-            .context("failed to deserialize configuration")
+            .context("failed to deserialize configuration")?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn to_toml_string(&self) -> Result<String> {
@@ -73,6 +75,10 @@ impl AppConfig {
             proxy: &self.proxy,
         })
         .context("failed to render active configuration")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.mitm.validate(&self.proxy)
     }
 }
 
@@ -190,6 +196,8 @@ pub struct MitmConfig {
     pub enabled: bool,
     pub default_action: String,
     pub allow_hosts: Vec<String>,
+    pub ca_cert_path: PathBuf,
+    pub ca_key_path: PathBuf,
 }
 
 impl Default for MitmConfig {
@@ -198,8 +206,62 @@ impl Default for MitmConfig {
             enabled: false,
             default_action: "tunnel".to_string(),
             allow_hosts: Vec::new(),
+            ca_cert_path: PathBuf::from("certs/marsala-ca.pem"),
+            ca_key_path: PathBuf::from("certs/marsala-ca-key.pem"),
         }
     }
+}
+
+impl MitmConfig {
+    fn validate(&self, proxy: &ProxyConfig) -> Result<()> {
+        if self.default_action != "tunnel" {
+            bail!("mitm.default_action currently supports only \"tunnel\"");
+        }
+
+        for host in &self.allow_hosts {
+            validate_mitm_allow_host(host)?;
+        }
+
+        if self.enabled {
+            if !proxy.enabled {
+                bail!("mitm.enabled=true requires proxy.enabled=true");
+            }
+            if self.allow_hosts.is_empty() {
+                bail!("mitm.enabled=true requires at least one mitm.allow_hosts entry");
+            }
+            if self.ca_cert_path.as_os_str().is_empty() {
+                bail!("mitm.ca_cert_path must not be empty when MITM is enabled");
+            }
+            if self.ca_key_path.as_os_str().is_empty() {
+                bail!("mitm.ca_key_path must not be empty when MITM is enabled");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_mitm_allow_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        bail!("mitm.allow_hosts entries must not be empty");
+    }
+    if host != host.trim() {
+        bail!("mitm.allow_hosts entries must not contain surrounding whitespace");
+    }
+    if host.contains("://") || host.contains('/') {
+        bail!("mitm.allow_hosts entries must be hostnames, not URLs");
+    }
+    if host.contains(':') {
+        bail!("mitm.allow_hosts entries must not include ports");
+    }
+    if host.contains('*') {
+        bail!("mitm.allow_hosts entries must be exact hosts, not wildcards");
+    }
+    if host.chars().any(char::is_whitespace) {
+        bail!("mitm.allow_hosts entries must not contain whitespace");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -357,6 +419,98 @@ capture_stream_chunks = true
             config.mitm.allow_hosts,
             vec!["a".to_string(), "b".to_string()]
         );
+    }
+
+    #[test]
+    fn mitm_config_shape_includes_ca_paths() {
+        let config = AppConfig::default();
+
+        assert_eq!(
+            config.mitm.ca_cert_path,
+            PathBuf::from("certs/marsala-ca.pem")
+        );
+        assert_eq!(
+            config.mitm.ca_key_path,
+            PathBuf::from("certs/marsala-ca-key.pem")
+        );
+    }
+
+    #[test]
+    fn mitm_enabled_requires_proxy_and_allowlist() {
+        let _env_guard = EnvGuard::isolate_marsala();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("marsala.toml");
+        fs::write(
+            &config_path,
+            r#"
+[mitm]
+enabled = true
+allow_hosts = ["api.openai.com"]
+"#,
+        )
+        .expect("write config");
+
+        let error =
+            AppConfig::load(Some(&config_path)).expect_err("mitm enabled without proxy must fail");
+        let message = error_chain(&error);
+
+        assert!(message.contains("proxy.enabled=true"));
+    }
+
+    #[test]
+    fn mitm_enabled_requires_non_empty_allowlist() {
+        let _env_guard = EnvGuard::isolate_marsala();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("marsala.toml");
+        fs::write(
+            &config_path,
+            r#"
+[proxy]
+enabled = true
+
+[mitm]
+enabled = true
+"#,
+        )
+        .expect("write config");
+
+        let error =
+            AppConfig::load(Some(&config_path)).expect_err("mitm enabled without hosts must fail");
+        let message = error_chain(&error);
+
+        assert!(message.contains("mitm.allow_hosts"));
+    }
+
+    #[test]
+    fn mitm_allow_hosts_are_exact_hostnames() {
+        let _env_guard = EnvGuard::isolate_marsala();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+
+        for host in [
+            "",
+            " api.openai.com",
+            "https://api.openai.com",
+            "api.openai.com:443",
+            "*.openai.com",
+            "api.openai.com/v1",
+        ] {
+            let config_path = tempdir.path().join("marsala.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+[mitm]
+allow_hosts = ["{host}"]
+"#
+                ),
+            )
+            .expect("write config");
+
+            assert!(
+                AppConfig::load(Some(&config_path)).is_err(),
+                "expected invalid host to fail: {host}"
+            );
+        }
     }
 
     #[test]

@@ -17,3 +17,10 @@ capture_stream_chunks = false
 enabled = false
 host = "127.0.0.1"
 port = 8788
+
+[mitm]
+enabled = false
+default_action = "tunnel"
+allow_hosts = []
+ca_cert_path = "certs/marsala-ca.pem"
+ca_key_path = "certs/marsala-ca-key.pem"

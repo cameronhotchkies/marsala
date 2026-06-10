@@ -110,7 +110,16 @@ Proxy probe settings:
 - Body logging and stream capture are disabled by default
 - WebSocket upgrade/proxy support for `/v1/responses` is not implemented; use the custom-provider `supports_websockets=false` setting above for Codex validation
 
+MITM foundation settings:
+
+- `mitm.enabled=false` keeps TLS interception off by default
+- `mitm.default_action="tunnel"` is the only supported default action in this foundation
+- `mitm.allow_hosts` must contain exact hostnames only, such as `api.openai.com` or `chatgpt.com`; URLs, ports, and wildcards are rejected
+- `mitm.ca_cert_path` and `mitm.ca_key_path` define the local CA paths for the planned CA generation/export command
+- `mitm.enabled=true` currently validates config only and requires `proxy.enabled=true` plus a non-empty allowlist; it does not decrypt traffic yet
+
 See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
+See [docs/planning/05_mitm_foundation.md](docs/planning/05_mitm_foundation.md) for the planned allowlisted MITM steel thread and Rust stack.
 
 ## Docker
 

@@ -139,3 +139,5 @@ Expected: direct `responses_request`; no `proxy_request`.
 - Plain HTTP proxy forwarding is not implemented; it logs metadata and returns local `501`.
 - HTTPS `CONNECT` is tunneled without MITM, decryption, request body capture, or response body capture.
 - Marsala cannot observe `/v1/responses` paths inside HTTPS tunnels without future opt-in MITM support.
+
+See [mitm-steel-thread.md](mitm-steel-thread.md) for the planned allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY` and `CODEX_CA_CERTIFICATE`.
