@@ -40,6 +40,14 @@ use crate::{
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_MITM_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MITM_REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MITM_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MITM_UPSTREAM_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MITM_RESPONSE_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_millis(200);
 
 pub async fn serve(
     config: AppConfig,
@@ -689,7 +697,7 @@ fn emit_mitm_request_event(event_log: &EventLogHandle, event: MitmRequestEvent<'
     }
     if let Some(request) = event.request {
         data.insert("method".into(), request.method.clone().into());
-        data.insert("path".into(), redact_path_query(&request.target).into());
+        data.insert("path".into(), sanitize_target(&request.target).into());
         data.insert("http_version".into(), request.version.clone().into());
         data.insert("header_bytes".into(), (request.header_bytes as u64).into());
         if let Some(request_body_bytes) = event.request_body_bytes {
@@ -850,6 +858,18 @@ where
         ));
     }
 
+    if let Err(message) = validate_mitm_request_authority(request, host, port) {
+        write_mitm_http_error_response(
+            downstream.get_mut(),
+            400,
+            "Bad Request",
+            "mitm_authority_mismatch",
+            "Marsala rejected a decrypted request whose authority did not match the CONNECT target",
+        )
+        .await?;
+        return Ok(MitmForwardResult::rejected("authority_mismatch", message));
+    }
+
     if is_websocket_upgrade(request) {
         write_mitm_http_error_response(
             downstream.get_mut(),
@@ -880,7 +900,23 @@ where
         ));
     }
 
-    let request_body_len = request_content_length(request)?;
+    let request_body_len = match request_content_length(request) {
+        Ok(request_body_len) => request_body_len,
+        Err(error) => {
+            write_mitm_http_error_response(
+                downstream.get_mut(),
+                400,
+                "Bad Request",
+                "mitm_invalid_content_length",
+                "Marsala rejected an ambiguous or invalid Content-Length header",
+            )
+            .await?;
+            return Ok(MitmForwardResult::rejected(
+                "invalid_content_length",
+                &error.to_string(),
+            ));
+        }
+    };
     if request_body_len > MAX_MITM_REQUEST_BODY_BYTES {
         write_mitm_http_error_response(
             downstream.get_mut(),
@@ -898,26 +934,77 @@ where
 
     let mut request_body = vec![0u8; request_body_len];
     if request_body_len > 0 {
-        downstream
-            .read_exact(&mut request_body)
-            .await
-            .context("failed to read bounded MITM request body")?;
+        match timeout(
+            MITM_REQUEST_BODY_READ_TIMEOUT,
+            downstream.read_exact(&mut request_body),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("failed to read bounded MITM request body")
+            }
+            Err(_) => {
+                write_mitm_http_error_response(
+                    downstream.get_mut(),
+                    408,
+                    "Request Timeout",
+                    "mitm_request_body_timeout",
+                    "Marsala timed out while reading the bounded request body",
+                )
+                .await?;
+                return Ok(MitmForwardResult::rejected(
+                    "request_body_timeout",
+                    "timed out while reading bounded MITM request body",
+                ));
+            }
+        }
     }
 
     let mut upstream = connect_upstream_tls(host, port).await?;
     write_upstream_request(&mut upstream, host, port, request, &request_body).await?;
 
     let mut upstream_reader = BufReader::new(upstream);
-    let response = read_http_response(&mut upstream_reader).await?;
+    let response = timeout(
+        MITM_RESPONSE_HEADER_READ_TIMEOUT,
+        read_http_response(&mut upstream_reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out while reading MITM upstream response headers"))??;
     let response_header = serialize_downstream_response(&response);
     downstream
         .get_mut()
         .write_all(response_header.as_bytes())
         .await
         .context("failed to write MITM response headers downstream")?;
-    let response_body_bytes = io::copy(&mut upstream_reader, downstream.get_mut())
-        .await
-        .context("failed to stream MITM response body downstream")?;
+    let response_body_bytes = match timeout(
+        MITM_RESPONSE_BODY_COPY_TIMEOUT,
+        io::copy(&mut upstream_reader, downstream.get_mut()),
+    )
+    .await
+    {
+        Ok(Ok(response_body_bytes)) => response_body_bytes,
+        Ok(Err(error)) => {
+            return Err(error).context("failed to stream MITM response body downstream")
+        }
+        Err(_) => {
+            let message = "timed out while streaming MITM upstream response body";
+            return Ok(MitmForwardResult {
+                request_status: "forwarded",
+                request_body_bytes: request_body_len as u64,
+                request_error: None,
+                response: Some(MitmResponseResult {
+                    status: "response_body_timeout",
+                    upstream_status: Some(response.status_code),
+                    response_header_bytes: Some(response.header_bytes as u64),
+                    response_body_bytes: None,
+                    error: Some(message.to_string()),
+                }),
+                proxy_status: "response_body_timeout",
+                proxy_error: Some(message.to_string()),
+            });
+        }
+    };
 
     Ok(MitmForwardResult {
         request_status: "forwarded",
@@ -941,19 +1028,28 @@ async fn connect_upstream_tls(
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     ensure_rustls_crypto_provider();
     let connect_addr = format!("{host}:{port}");
-    let stream = TcpStream::connect(&connect_addr)
-        .await
-        .with_context(|| format!("failed to connect MITM upstream {connect_addr}"))?;
+    let stream = timeout(
+        MITM_UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(&connect_addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting MITM upstream {connect_addr}"))?
+    .with_context(|| format!("failed to connect MITM upstream {connect_addr}"))?;
     let server_name = ServerName::try_from(host.to_string())
         .with_context(|| format!("invalid MITM upstream DNS name {host}"))?;
     let client_config = ClientConfig::builder()
         .with_root_certificates(mitm_upstream_root_store())
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(client_config));
-    connector
-        .connect(server_name, stream)
-        .await
-        .with_context(|| format!("failed MITM upstream TLS handshake with {connect_addr}"))
+    timeout(
+        MITM_UPSTREAM_TLS_HANDSHAKE_TIMEOUT,
+        connector.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("timed out during MITM upstream TLS handshake with {connect_addr}")
+    })?
+    .with_context(|| format!("failed MITM upstream TLS handshake with {connect_addr}"))
 }
 
 fn mitm_upstream_root_store() -> RootCertStore {
@@ -1175,24 +1271,85 @@ fn is_http2_request(request: &ProxyRequest, alpn: Option<&str>) -> bool {
 
 fn is_websocket_upgrade(request: &ProxyRequest) -> bool {
     header_value(&request.headers, "upgrade")
-        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .map(|value| value.trim().eq_ignore_ascii_case("websocket"))
         .unwrap_or(false)
-        || header_value(&request.headers, "connection")
-            .map(|value| {
-                value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
-            })
-            .unwrap_or(false)
+}
+
+fn validate_mitm_request_authority(
+    request: &ProxyRequest,
+    connect_host: &str,
+    connect_port: u16,
+) -> std::result::Result<(), &'static str> {
+    let mut target_has_matching_authority = false;
+    if let Some((scheme, rest)) = request.target.split_once("://") {
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            let default_port = if scheme.eq_ignore_ascii_case("http") {
+                80
+            } else {
+                443
+            };
+            let (authority, _) = split_authority_path(rest);
+            let Some((target_host, target_port)) = parse_authority(authority, default_port) else {
+                return Err("absolute-form request authority is invalid");
+            };
+            if !authority_matches(connect_host, connect_port, &target_host, target_port) {
+                return Err("absolute-form request authority does not match CONNECT target");
+            }
+            target_has_matching_authority = true;
+        }
+    }
+
+    let mut has_host = false;
+    for (_, value) in request.headers.iter().filter(|(name, _)| name == "host") {
+        has_host = true;
+        let Some((host, port)) = parse_authority(value, 443) else {
+            return Err("Host header authority is invalid");
+        };
+        if !authority_matches(connect_host, connect_port, &host, port) {
+            return Err("Host header authority does not match CONNECT target");
+        }
+    }
+
+    if !has_host && !target_has_matching_authority {
+        return Err("HTTP/1.1 origin-form request is missing Host header");
+    }
+
+    Ok(())
+}
+
+fn authority_matches(connect_host: &str, connect_port: u16, host: &str, port: u16) -> bool {
+    connect_host.eq_ignore_ascii_case(host) && connect_port == port
 }
 
 fn request_content_length(request: &ProxyRequest) -> Result<usize> {
-    let Some(value) = header_value(&request.headers, "content-length") else {
+    let values = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "content-length")
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    let Some(value) = values.first() else {
         return Ok(0);
     };
-    value
+    let first = value
         .parse::<usize>()
-        .context("invalid MITM request content-length")
+        .context("invalid MITM request content-length")?;
+    if values.len() > 1 {
+        for value in values.iter().skip(1) {
+            let next = value
+                .parse::<usize>()
+                .context("invalid MITM request content-length")?;
+            if next != first {
+                return Err(anyhow::anyhow!(
+                    "conflicting MITM request content-length headers"
+                ));
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "duplicate MITM request content-length headers"
+        ));
+    }
+    Ok(first)
 }
 
 fn upstream_request_target(target: &str) -> String {
@@ -1342,6 +1499,9 @@ fn parse_authority(value: &str, default_port: u16) -> Option<(String, u16)> {
 
 fn sanitize_target(target: &str) -> String {
     let Some((scheme, rest)) = target.split_once("://") else {
+        if target.starts_with('/') {
+            return redact_path_query(target);
+        }
         return sanitize_authority(target);
     };
     let (authority, path) = split_authority_path(rest);
@@ -1492,11 +1652,12 @@ struct MitmResponseResult {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::BufReader as StdBufReader};
+    use std::{fs, io::BufReader as StdBufReader, path::PathBuf};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::{oneshot, watch},
+        task::JoinHandle,
     };
     use tokio_rustls::{
         rustls::{pki_types::ServerName, ClientConfig, RootCertStore},
@@ -1610,7 +1771,11 @@ mod tests {
 
         let mut tls = connect_mitm_client(addr, upstream_addr, &ca_cert_path).await;
         tls.write_all(
-            b"POST /backend-api/codex?api_key=query-secret HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer direct-secret\r\nproxy-authorization: Basic inner-proxy-secret\r\ncookie: session=session-secret\r\nconnection: keep-alive, x-hop\r\nx-hop: remove-me\r\ncontent-length: 4\r\n\r\nping",
+            format!(
+                "POST /backend-api/codex?api_key=query-secret HTTP/1.1\r\nhost: localhost:{}\r\nauthorization: Bearer direct-secret\r\nproxy-authorization: Basic inner-proxy-secret\r\ncookie: session=session-secret\r\nconnection: keep-alive, x-hop\r\nx-hop: remove-me\r\ncontent-length: 4\r\n\r\nping",
+                upstream_addr.port()
+            )
+            .as_bytes(),
         )
         .await
         .expect("write http request");
@@ -1742,9 +1907,15 @@ mod tests {
         ));
 
         let mut tls = connect_mitm_client(addr, upstream_addr, &ca_cert_path).await;
-        tls.write_all(b"GET /failure HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .await
-            .expect("write http request");
+        tls.write_all(
+            format!(
+                "GET /failure HTTP/1.1\r\nhost: localhost:{}\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write http request");
         let mut response = Vec::new();
         tls.read_to_end(&mut response).await.expect("read response");
         let response = String::from_utf8_lossy(&response);
@@ -1901,6 +2072,306 @@ mod tests {
         assert_eq!(request_event["data"]["http_version"], "HTTP/2.0");
     }
 
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_absolute_form_authority_mismatch() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(
+            b"GET https://example.com/backend-api/codex?api_key=query-secret HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_authority_mismatch"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("query-secret"));
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "authority_mismatch");
+        assert_eq!(
+            request_event["data"]["error"],
+            "absolute-form request authority does not match CONNECT target"
+        );
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_response"));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_host_authority_mismatch() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(b"GET /backend-api/codex HTTP/1.1\r\nhost: example.com\r\n\r\n")
+            .await
+            .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_authority_mismatch"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "authority_mismatch");
+        assert_eq!(
+            request_event["data"]["error"],
+            "Host header authority does not match CONNECT target"
+        );
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_response"));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_origin_form_missing_host() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(b"GET /backend-api/codex HTTP/1.1\r\n\r\n")
+            .await
+            .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_authority_mismatch"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "authority_mismatch");
+        assert_eq!(
+            request_event["data"]["error"],
+            "HTTP/1.1 origin-form request is missing Host header"
+        );
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_response"));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_duplicate_content_length() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(
+            b"POST /body HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4\r\ncontent-length: 4\r\n\r\nping",
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_invalid_content_length"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "invalid_content_length");
+        assert_eq!(
+            request_event["data"]["error"],
+            "duplicate MITM request content-length headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_conflicting_content_length() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(
+            b"POST /body HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4\r\ncontent-length: 5\r\n\r\nping",
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_invalid_content_length"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "invalid_content_length");
+        assert_eq!(
+            request_event["data"]["error"],
+            "conflicting MITM request content-length headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_websocket_upgrade() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(
+            b"GET /socket HTTP/1.1\r\nhost: localhost\r\nconnection: keep-alive, Upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("501 Not Implemented"));
+        assert!(response.contains("mitm_websocket_unsupported"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "websocket_unsupported");
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_times_out_streaming_upstream_response_body() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+        let (upstream_addr, upstream_task) = spawn_tls_upstream_hanging_response(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\nconnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /slow HTTP/1.1\r\nhost: localhost:{}\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("200 OK"));
+
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let response_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_response")
+            .expect("mitm response event");
+        assert_eq!(response_event["data"]["status"], "response_body_timeout");
+        assert_eq!(response_event["data"]["upstream_status"], 200);
+        assert_eq!(
+            response_event["data"]["error"],
+            "timed out while streaming MITM upstream response body"
+        );
+    }
+
+    struct RunningMitmProxy {
+        addr: SocketAddr,
+        ca_cert_path: PathBuf,
+        log_path: PathBuf,
+        shutdown_tx: watch::Sender<bool>,
+        task: JoinHandle<Result<()>>,
+        writer: EventLogWriter,
+    }
+
+    impl RunningMitmProxy {
+        async fn shutdown(mut self) {
+            self.shutdown_tx.send(true).expect("shutdown");
+            self.task.await.expect("task").expect("serve listener");
+            self.writer.shutdown().await.expect("writer shutdown");
+        }
+    }
+
+    async fn spawn_allowlisted_mitm_proxy(tempdir: &tempfile::TempDir) -> RunningMitmProxy {
+        let log_path = tempdir.path().join("events.jsonl");
+        let writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = AppConfig::default();
+        config.proxy.enabled = true;
+        config.mitm.enabled = true;
+        config.mitm.allow_hosts = vec!["localhost".to_string()];
+        config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
+        config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        init_ca(&config.mitm).expect("init ca");
+        let ca_cert_path = config.mitm.ca_cert_path.clone();
+        let task = tokio::spawn(serve_listener(
+            listener,
+            config,
+            writer.handle(),
+            shutdown_rx,
+        ));
+
+        RunningMitmProxy {
+            addr,
+            ca_cert_path,
+            log_path,
+            shutdown_tx,
+            task,
+            writer,
+        }
+    }
+
+    fn read_json_records(log_path: &std::path::Path) -> Vec<Value> {
+        read_tail_lines(log_path, 50)
+            .expect("read lines")
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("json"))
+            .collect()
+    }
+
     struct CapturedUpstreamRequest {
         request: ProxyRequest,
         body: Vec<u8>,
@@ -1945,6 +2416,41 @@ mod tests {
             let _ = reader.get_mut().shutdown().await;
         });
         (addr, request_rx, task)
+    }
+
+    async fn spawn_tls_upstream_hanging_response(
+        response_head: Vec<u8>,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let (server_config, root_cert) = test_upstream_server_config();
+        trust_test_upstream_root(root_cert);
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let addr = listener.local_addr().expect("upstream local addr");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("upstream accept");
+            let mut tls = acceptor.accept(stream).await.expect("upstream tls accept");
+            let mut reader = BufReader::new(&mut tls);
+            let request = read_proxy_request(&mut reader)
+                .await
+                .expect("read upstream request");
+            let body_len = request_content_length(&request).expect("request content-length");
+            let mut body = vec![0u8; body_len];
+            if body_len > 0 {
+                reader
+                    .read_exact(&mut body)
+                    .await
+                    .expect("read upstream request body");
+            }
+            reader
+                .get_mut()
+                .write_all(&response_head)
+                .await
+                .expect("write upstream response head");
+            std::future::pending::<()>().await;
+        });
+        (addr, task)
     }
 
     fn test_upstream_server_config() -> (ServerConfig, CertificateDer<'static>) {
@@ -2064,5 +2570,18 @@ mod tests {
             sanitize_target(&request.target),
             "[redacted]@api.openai.com:443"
         );
+    }
+
+    #[test]
+    fn connection_upgrade_without_upgrade_websocket_is_not_websocket() {
+        let request = ProxyRequest {
+            method: "GET".to_string(),
+            target: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("connection".to_string(), "upgrade".to_string())],
+            header_bytes: 64,
+        };
+
+        assert!(!is_websocket_upgrade(&request));
     }
 }

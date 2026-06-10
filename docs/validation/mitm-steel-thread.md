@@ -1,6 +1,6 @@
 # MITM Steel Thread Validation
 
-Status: HTTP/1.1 forwarding proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, forward decrypted HTTP/1.1 requests upstream over verified TLS to the same host:port, stream upstream responses back downstream, and emit sanitized `mitm_tls`, `mitm_request`, and `mitm_response` metadata.
+Status: HTTP/1.1 forwarding proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, forward decrypted HTTP/1.1 requests upstream over verified TLS to the same host:port, copy upstream responses back downstream within the current operation timeout, and emit sanitized `mitm_tls`, `mitm_request`, and `mitm_response` metadata.
 
 Observed facts:
 
@@ -91,9 +91,10 @@ Expected today:
 - For allowlisted ChatGPT hosts, `connect_action=mitm`.
 - `mitm_tls` with the same exact host and `status=handshake_ok`, or `status=error` if the client does not trust the generated CA.
 - `mitm_request` with sanitized `method`, redacted `path`, `auth_shape`, and bounded request byte counts for decrypted HTTP/1.1 requests.
-- `mitm_response` with upstream status and response byte counts when forwarding reaches the upstream server.
-- The client receives the upstream HTTP/1.1 response when the request has no body or a `Content-Length` body up to 1 MiB.
+- `mitm_response` with upstream status and response byte counts when forwarding reaches the upstream server and the response body finishes before the steel-thread timeout.
+- The client receives the upstream HTTP/1.1 response when the request has no body or a `Content-Length` body up to 1 MiB and the response body copy does not exceed the current operation timeout.
 - HTTP/2, WebSocket upgrades, and request `Transfer-Encoding` streaming are logged as explicit unsupported MITM statuses.
+- Stalled upstream response bodies are logged with `response_body_timeout`; this proof does not provide unbounded response streaming.
 - Non-allowlisted HTTPS targets, including observed `github.com` traffic, still tunnel and do not produce `mitm_tls` or `mitm_request`.
 
 ## CA Fallback
@@ -112,7 +113,7 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
 
 ## Remaining Full-MITM Gap
 
-The current proof terminates downstream TLS and forwards HTTP/1.1 requests/responses without logging bodies or chunks.
+The current proof terminates downstream TLS and forwards HTTP/1.1 requests/responses without logging bodies or chunks. Response body forwarding is bounded by the current operation timeout.
 
 Still missing:
 

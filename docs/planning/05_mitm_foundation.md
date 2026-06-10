@@ -1,6 +1,6 @@
 # MITM Foundation Plan
 
-Status: active mainline. Marsala can generate a local CA, select exact allowlisted `CONNECT` targets, terminate downstream TLS, forward decrypted HTTP/1.1 requests upstream over verified TLS, stream upstream responses downstream, and log sanitized MITM metadata.
+Status: active mainline. Marsala can generate a local CA, select exact allowlisted `CONNECT` targets, terminate downstream TLS, forward decrypted HTTP/1.1 requests upstream over verified TLS, copy upstream responses downstream within the current steel-thread timeout policy, and log sanitized MITM metadata.
 
 ## Decision
 
@@ -78,7 +78,7 @@ Flow:
    - If Codex requires `h2`, record that as the next blocker and add HTTP/2 support before claiming interception.
 7. Parse the decrypted HTTP/1.1 request headers.
 8. Forward method, URI, sanitized hop-by-hop-filtered headers, and no-body or bounded `Content-Length` bodies upstream without substituting or logging auth values.
-9. Return upstream status, safe headers, and response body stream to the client.
+9. Return upstream status, safe headers, and response body bytes to the client within the current operation timeout.
 10. Log sanitized metadata only:
     - event type, peer address, host, port
     - `interception=mitm`
@@ -115,7 +115,7 @@ Completed implementation slices:
 7. Non-allowlisted targets tunnel unchanged.
 8. Upstream TLS connection to the exact allowlisted target host with normal certificate verification.
 9. HTTP/1.1 request forwarding with auth/session headers preserved upstream and proxy/hop-by-hop headers stripped.
-10. Upstream response forwarding without body/chunk logging.
+10. Upstream response forwarding without body/chunk logging, bounded by the current response-copy timeout.
 11. Sanitized `mitm_response` metadata with upstream status, timing, and byte counts.
 12. Explicit unsupported statuses for HTTP/2, WebSocket upgrades, and request transfer-encoding streaming.
 
