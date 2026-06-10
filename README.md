@@ -128,7 +128,7 @@ Proxy probe settings:
 
 - `proxy.enabled=true` starts a metadata-only proxy listener on `proxy.host:proxy.port`
 - Plain HTTP proxy requests are logged and return local `501 not_implemented`
-- HTTPS `CONNECT` requests are logged and tunneled without MITM or decryption
+- HTTPS `CONNECT` requests are logged; non-allowlisted targets are tunneled without MITM or decryption
 - Body logging and stream capture are disabled by default
 - WebSocket upgrade/proxy support for `/v1/responses` is not implemented; use the custom-provider `supports_websockets=false` setting above for Codex validation
 
@@ -136,10 +136,11 @@ MITM foundation settings:
 
 - `mitm.enabled=false` keeps TLS interception off by default
 - `mitm.default_action="tunnel"` is the only supported default action in this foundation
-- `mitm.allow_hosts` must contain exact hostnames only, such as `api.openai.com` or `chatgpt.com`; URLs, ports, and wildcards are rejected
+- `mitm.allow_hosts` must contain exact hostnames only, such as `chatgpt.com`, `ab.chatgpt.com`, or API-path `api.openai.com`; URLs, ports, and wildcards are rejected
 - `mitm.ca_cert_path` and `mitm.ca_key_path` define where `marsala mitm ca init` writes the local CA certificate and private key
-- `mitm.enabled=true` currently validates config and enables the exact-host allowlist decision helper; this slice still tunnels `CONNECT` traffic and does not decrypt HTTPS payloads yet
+- `mitm.enabled=true` terminates TLS only for exact allowlisted `CONNECT` hosts, generates a per-host leaf certificate from the configured CA, logs sanitized `mitm_tls` metadata, reads the first decrypted HTTP/1.1 request headers when available, logs sanitized `mitm_request` metadata, and returns local `501 mitm_http_forwarding_unimplemented`
 - MITM is now the main path for discovering the real subscription-backed normal Codex upstream shape, because inbound-auth passthrough to public `api.openai.com` has been observed to return `401 Unauthorized`
+- Normal subscription-backed Codex has been observed connecting to `chatgpt.com:443` and `ab.chatgpt.com:443`; do not add unrelated hosts such as `github.com` to the MITM allowlist
 
 Generate the local Marsala CA without overwriting existing files:
 
@@ -152,11 +153,13 @@ Run Marsala with the proxy and an exact MITM allowlist:
 ```bash
 MARSALA__PROXY__ENABLED=true \
 MARSALA__MITM__ENABLED=true \
-MARSALA__MITM__ALLOW_HOSTS=api.openai.com,chatgpt.com \
+MARSALA__MITM__ALLOW_HOSTS=chatgpt.com,ab.chatgpt.com \
 MARSALA__MITM__CA_CERT_PATH=certs/marsala-ca.pem \
 MARSALA__MITM__CA_KEY_PATH=certs/marsala-ca-key.pem \
   cargo run -p marsala -- serve
 ```
+
+For API/custom-provider validation, use `MARSALA__MITM__ALLOW_HOSTS=api.openai.com` instead or add it alongside the exact ChatGPT hosts.
 
 Run normal Codex through Marsala's HTTPS proxy and point Codex at the generated CA:
 
@@ -165,12 +168,12 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
   HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
   CODEX_CA_CERTIFICATE="$PWD/certs/marsala-ca.pem" \
   codex exec \
-    -c 'openai_base_url="https://api.openai.com/v1"' \
-    -c 'model="gpt-5"' \
+    --skip-git-repo-check \
+    -c 'approval_policy="never"' \
     'Reply with one short sentence.'
 ```
 
-Expected for this slice: Marsala logs the `CONNECT` metadata and tunnels the HTTPS connection. The generated CA and `CODEX_CA_CERTIFICATE` prepare the trust path, but no decrypted request path, body, stream chunk, or `mitm_request` event is produced yet.
+Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, and emits `mitm_request` with sanitized method/path/auth-shape metadata for the first decrypted HTTP/1.1 request when the client sends one. Marsala then returns local `501 mitm_http_forwarding_unimplemented`; upstream forwarding, request body capture, response body capture, and stream forwarding are still not implemented.
 
 See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
 See [docs/planning/05_mitm_foundation.md](docs/planning/05_mitm_foundation.md) for the planned allowlisted MITM steel thread and Rust stack.

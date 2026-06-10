@@ -1,17 +1,33 @@
-use std::{net::SocketAddr, time::Instant};
+use std::{
+    fs,
+    net::SocketAddr,
+    sync::{Arc, Once},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use serde_json::{Map, Value};
 use tokio::{
-    io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::watch,
     time::{timeout, Duration},
 };
+use tokio_rustls::{
+    rustls::{
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        ServerConfig,
+    },
+    TlsAcceptor,
+};
 use tracing::{debug, info};
 
 use crate::{
-    config::{AppConfig, MitmConnectAction},
+    config::{AppConfig, MitmConfig, MitmConnectAction},
     event_log::EventLogHandle,
 };
 
@@ -151,24 +167,15 @@ async fn handle_connect(
     };
 
     let connect_action = match config.mitm_connect_action_for_host(&host) {
-        MitmConnectAction::Mitm => ConnectAction::MitmUnimplemented,
+        MitmConnectAction::Mitm => ConnectAction::Mitm,
         MitmConnectAction::Tunnel => ConnectAction::Tunnel,
     };
 
-    if connect_action == ConnectAction::MitmUnimplemented {
-        write_mitm_unimplemented_response(reader.get_mut()).await?;
-        emit_proxy_event(
-            &event_log,
-            ProxyEvent {
-                started,
-                peer_addr,
-                request: Some(request),
-                status: "mitm_unimplemented",
-                connect_action: Some(connect_action),
-                error: None,
-            },
-        );
-        return Ok(());
+    if connect_action == ConnectAction::Mitm {
+        return handle_mitm_connect(
+            reader, peer_addr, config, event_log, started, request, host, port,
+        )
+        .await;
     }
 
     let connect_addr = format!("{host}:{port}");
@@ -222,6 +229,204 @@ async fn handle_connect(
     Ok(())
 }
 
+async fn handle_mitm_connect(
+    mut reader: BufReader<TcpStream>,
+    peer_addr: SocketAddr,
+    config: AppConfig,
+    event_log: EventLogHandle,
+    started: Instant,
+    request: ProxyRequest,
+    host: String,
+    port: u16,
+) -> Result<()> {
+    let acceptor = match mitm_tls_acceptor(&config.mitm, &host) {
+        Ok(acceptor) => acceptor,
+        Err(error) => {
+            let message = format!("failed to prepare MITM TLS config: {error}");
+            let _ = reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            emit_mitm_tls_event(
+                &event_log,
+                MitmTlsEvent {
+                    started,
+                    target_host: &host,
+                    target_port: port,
+                    status: "error",
+                    alpn: None,
+                    error: Some(message.clone()),
+                },
+            );
+            emit_proxy_event(
+                &event_log,
+                ProxyEvent {
+                    started,
+                    peer_addr,
+                    request: Some(request),
+                    status: "error",
+                    connect_action: Some(ConnectAction::Mitm),
+                    error: Some(message.clone()),
+                },
+            );
+            return Err(anyhow::anyhow!(message));
+        }
+    };
+
+    reader
+        .get_mut()
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .context("failed to acknowledge MITM CONNECT")?;
+
+    let stream = reader.into_inner();
+    let mut tls_stream = match timeout(HEADER_READ_TIMEOUT, acceptor.accept(stream)).await {
+        Ok(Ok(tls_stream)) => tls_stream,
+        Ok(Err(error)) => {
+            let message = format!("MITM TLS handshake failed: {error}");
+            emit_mitm_tls_event(
+                &event_log,
+                MitmTlsEvent {
+                    started,
+                    target_host: &host,
+                    target_port: port,
+                    status: "error",
+                    alpn: None,
+                    error: Some(message.clone()),
+                },
+            );
+            emit_proxy_event(
+                &event_log,
+                ProxyEvent {
+                    started,
+                    peer_addr,
+                    request: Some(request),
+                    status: "error",
+                    connect_action: Some(ConnectAction::Mitm),
+                    error: Some(message.clone()),
+                },
+            );
+            return Err(anyhow::anyhow!(message));
+        }
+        Err(_) => {
+            let message = "timed out during MITM TLS handshake".to_string();
+            emit_mitm_tls_event(
+                &event_log,
+                MitmTlsEvent {
+                    started,
+                    target_host: &host,
+                    target_port: port,
+                    status: "error",
+                    alpn: None,
+                    error: Some(message.clone()),
+                },
+            );
+            emit_proxy_event(
+                &event_log,
+                ProxyEvent {
+                    started,
+                    peer_addr,
+                    request: Some(request),
+                    status: "error",
+                    connect_action: Some(ConnectAction::Mitm),
+                    error: Some(message.clone()),
+                },
+            );
+            return Err(anyhow::anyhow!(message));
+        }
+    };
+
+    let alpn = tls_stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|value| String::from_utf8_lossy(value).to_string());
+    emit_mitm_tls_event(
+        &event_log,
+        MitmTlsEvent {
+            started,
+            target_host: &host,
+            target_port: port,
+            status: "handshake_ok",
+            alpn: alpn.as_deref(),
+            error: None,
+        },
+    );
+
+    let mut tls_reader = BufReader::new(&mut tls_stream);
+    let (status, error) =
+        match timeout(HEADER_READ_TIMEOUT, read_proxy_request(&mut tls_reader)).await {
+            Ok(Ok(http_request)) => {
+                let request_status = if is_http2_request(&http_request, alpn.as_deref()) {
+                    "http2_unsupported"
+                } else {
+                    "mitm_http_forwarding_unimplemented"
+                };
+                emit_mitm_request_event(
+                    &event_log,
+                    MitmRequestEvent {
+                        started,
+                        target_host: &host,
+                        target_port: port,
+                        request: Some(&http_request),
+                        status: request_status,
+                        alpn: alpn.as_deref(),
+                        error: None,
+                    },
+                );
+                write_mitm_http_unimplemented_response(tls_reader.get_mut()).await?;
+                let _ = tls_reader.get_mut().shutdown().await;
+                (request_status, None)
+            }
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                emit_mitm_request_event(
+                    &event_log,
+                    MitmRequestEvent {
+                        started,
+                        target_host: &host,
+                        target_port: port,
+                        request: None,
+                        status: "error",
+                        alpn: alpn.as_deref(),
+                        error: Some(message.clone()),
+                    },
+                );
+                ("error", Some(message))
+            }
+            Err(_) => {
+                let message = "timed out while reading decrypted MITM request headers".to_string();
+                emit_mitm_request_event(
+                    &event_log,
+                    MitmRequestEvent {
+                        started,
+                        target_host: &host,
+                        target_port: port,
+                        request: None,
+                        status: "error",
+                        alpn: alpn.as_deref(),
+                        error: Some(message.clone()),
+                    },
+                );
+                ("error", Some(message))
+            }
+        };
+
+    emit_proxy_event(
+        &event_log,
+        ProxyEvent {
+            started,
+            peer_addr,
+            request: Some(request),
+            status,
+            connect_action: Some(ConnectAction::Mitm),
+            error,
+        },
+    );
+
+    Ok(())
+}
+
 async fn handle_plain_http(
     mut reader: BufReader<TcpStream>,
     peer_addr: SocketAddr,
@@ -260,7 +465,10 @@ async fn handle_plain_http(
     Ok(())
 }
 
-async fn read_proxy_request(reader: &mut BufReader<TcpStream>) -> Result<ProxyRequest> {
+async fn read_proxy_request<R>(reader: &mut R) -> Result<ProxyRequest>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut total_bytes = 0usize;
     let mut request_line = String::new();
     let read = reader
@@ -328,16 +536,85 @@ struct ProxyEvent<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectAction {
     Tunnel,
-    MitmUnimplemented,
+    Mitm,
 }
 
 impl ConnectAction {
     fn as_str(self) -> &'static str {
         match self {
             Self::Tunnel => "tunnel",
-            Self::MitmUnimplemented => "mitm_unimplemented",
+            Self::Mitm => "mitm",
         }
     }
+}
+
+struct MitmTlsEvent<'a> {
+    started: Instant,
+    target_host: &'a str,
+    target_port: u16,
+    status: &'a str,
+    alpn: Option<&'a str>,
+    error: Option<String>,
+}
+
+fn emit_mitm_tls_event(event_log: &EventLogHandle, event: MitmTlsEvent<'_>) {
+    let mut data = Map::new();
+    data.insert(
+        "elapsed_ms".into(),
+        (event.started.elapsed().as_millis() as u64).into(),
+    );
+    data.insert("target_host".into(), event.target_host.into());
+    data.insert("target_port".into(), event.target_port.into());
+    data.insert("status".into(), event.status.into());
+    data.insert("body_logging".into(), "disabled".into());
+    if let Some(alpn) = event.alpn {
+        data.insert("alpn".into(), alpn.into());
+    }
+    if let Some(error) = event.error {
+        data.insert("error".into(), error.into());
+    }
+
+    event_log.emit("mitm_tls", Value::Object(data));
+}
+
+struct MitmRequestEvent<'a> {
+    started: Instant,
+    target_host: &'a str,
+    target_port: u16,
+    request: Option<&'a ProxyRequest>,
+    status: &'a str,
+    alpn: Option<&'a str>,
+    error: Option<String>,
+}
+
+fn emit_mitm_request_event(event_log: &EventLogHandle, event: MitmRequestEvent<'_>) {
+    let mut data = Map::new();
+    data.insert(
+        "elapsed_ms".into(),
+        (event.started.elapsed().as_millis() as u64).into(),
+    );
+    data.insert("target_host".into(), event.target_host.into());
+    data.insert("target_port".into(), event.target_port.into());
+    data.insert("status".into(), event.status.into());
+    data.insert("body_logging".into(), "disabled".into());
+    if let Some(alpn) = event.alpn {
+        data.insert("alpn".into(), alpn.into());
+    }
+    if let Some(error) = event.error {
+        data.insert("error".into(), error.into());
+    }
+    if let Some(request) = event.request {
+        data.insert("method".into(), request.method.clone().into());
+        data.insert("path".into(), redact_path_query(&request.target).into());
+        data.insert("http_version".into(), request.version.clone().into());
+        data.insert("header_bytes".into(), (request.header_bytes as u64).into());
+        data.insert(
+            "auth_shape".into(),
+            Value::Object(proxy_auth_shape(&request.headers)),
+        );
+    }
+
+    event_log.emit("mitm_request", Value::Object(data));
 }
 
 fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
@@ -371,8 +648,11 @@ fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
     event_log.emit("proxy_request", Value::Object(data));
 }
 
-async fn write_mitm_unimplemented_response(stream: &mut TcpStream) -> Result<()> {
-    let response_body = br#"{"error":{"message":"Marsala selected allowlisted MITM for this CONNECT target, but TLS termination is not implemented in this build","type":"mitm_unimplemented","source":"marsala"}}"#;
+async fn write_mitm_http_unimplemented_response<W>(stream: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response_body = br#"{"error":{"message":"Marsala terminated TLS and observed the first decrypted request headers, but upstream MITM forwarding is not implemented in this build","type":"mitm_http_forwarding_unimplemented","source":"marsala"}}"#;
     let response = format!(
         "HTTP/1.1 501 Not Implemented\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         response_body.len()
@@ -380,12 +660,74 @@ async fn write_mitm_unimplemented_response(stream: &mut TcpStream) -> Result<()>
     stream
         .write_all(response.as_bytes())
         .await
-        .context("failed to write MITM unimplemented response")?;
+        .context("failed to write MITM HTTP unimplemented response")?;
     stream
         .write_all(response_body)
         .await
-        .context("failed to write MITM unimplemented response body")?;
+        .context("failed to write MITM HTTP unimplemented response body")?;
     Ok(())
+}
+
+fn mitm_tls_acceptor(config: &MitmConfig, host: &str) -> Result<TlsAcceptor> {
+    let server_config = mitm_server_config(config, host)?;
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+fn mitm_server_config(config: &MitmConfig, host: &str) -> Result<ServerConfig> {
+    ensure_rustls_crypto_provider();
+
+    let ca_cert_pem = fs::read_to_string(&config.ca_cert_path).with_context(|| {
+        format!(
+            "failed to read CA certificate {}",
+            config.ca_cert_path.display()
+        )
+    })?;
+    let ca_key_pem = fs::read_to_string(&config.ca_key_path).with_context(|| {
+        format!(
+            "failed to read CA private key {}",
+            config.ca_key_path.display()
+        )
+    })?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem).context("failed to parse CA private key")?;
+    let issuer =
+        Issuer::from_ca_cert_pem(&ca_cert_pem, ca_key).context("failed to parse CA certificate")?;
+
+    let leaf_key = KeyPair::generate().context("failed to generate MITM leaf private key")?;
+    let mut params = CertificateParams::new(vec![host.to_string()])
+        .with_context(|| format!("failed to create MITM leaf params for {host}"))?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, host);
+    params.distinguished_name = distinguished_name;
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+    let leaf_cert = params
+        .signed_by(&leaf_key, &issuer)
+        .with_context(|| format!("failed to sign MITM leaf certificate for {host}"))?;
+    let cert_chain = vec![CertificateDer::from(leaf_cert.der().to_vec())];
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .context("failed to build MITM TLS server config")
+}
+
+fn ensure_rustls_crypto_provider() {
+    static RUSTLS_PROVIDER: Once = Once::new();
+
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn is_http2_request(request: &ProxyRequest, alpn: Option<&str>) -> bool {
+    alpn == Some("h2")
+        || (request.method == "PRI" && request.target == "*" && request.version == "HTTP/2.0")
 }
 
 fn add_visible_target_fields(data: &mut Map<String, Value>, request: &ProxyRequest) {
@@ -565,14 +907,19 @@ struct ProxyRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, io::BufReader as StdBufReader};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::watch,
     };
+    use tokio_rustls::{
+        rustls::{pki_types::ServerName, ClientConfig, RootCertStore},
+        TlsConnector,
+    };
 
     use super::*;
+    use crate::certs::init_ca;
     use crate::event_log::{read_tail_lines, EventLogWriter};
 
     #[tokio::test]
@@ -648,7 +995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowlisted_connect_returns_mitm_unimplemented_metadata() {
+    async fn allowlisted_connect_terminates_tls_and_logs_sanitized_http_request() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let log_path = tempdir.path().join("events.jsonl");
         let mut writer = EventLogWriter::spawn(&log_path, true)
@@ -660,7 +1007,11 @@ mod tests {
         let mut config = AppConfig::default();
         config.proxy.enabled = true;
         config.mitm.enabled = true;
-        config.mitm.allow_hosts = vec!["api.openai.com".to_string()];
+        config.mitm.allow_hosts = vec!["chatgpt.com".to_string()];
+        config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
+        config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        init_ca(&config.mitm).expect("init ca");
+        let ca_cert_path = config.mitm.ca_cert_path.clone();
         let task = tokio::spawn(serve_listener(
             listener,
             config,
@@ -671,18 +1022,48 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.expect("connect proxy");
         client
             .write_all(
-                b"CONNECT api.openai.com:443 HTTP/1.1\r\nhost: api.openai.com:443\r\nproxy-authorization: Basic proxy-secret\r\n\r\n",
+                b"CONNECT chatgpt.com:443 HTTP/1.1\r\nhost: chatgpt.com:443\r\nproxy-authorization: Basic proxy-secret\r\n\r\n",
             )
             .await
             .expect("write request");
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
+        let mut connect_response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !connect_response.ends_with(b"\r\n\r\n") {
+            client
+                .read_exact(&mut byte)
+                .await
+                .expect("read connect response");
+            connect_response.push(byte[0]);
+        }
+        let connect_response = String::from_utf8_lossy(&connect_response);
+        assert!(connect_response.contains("200 Connection Established"));
+
+        let mut root_store = RootCertStore::empty();
+        let ca_cert_pem = fs::read(&ca_cert_path).expect("read ca cert");
+        let ca_certs = rustls_pemfile::certs(&mut StdBufReader::new(ca_cert_pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse ca certs");
+        assert_eq!(ca_certs.len(), 1);
+        root_store.add(ca_certs[0].clone()).expect("add root ca");
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server_name = ServerName::try_from("chatgpt.com").expect("server name");
+        let mut tls = connector
+            .connect(server_name, client)
             .await
-            .expect("read response");
+            .expect("tls handshake");
+        tls.write_all(
+            b"GET /backend-api/codex?api_key=query-secret HTTP/1.1\r\nhost: chatgpt.com\r\nauthorization: Bearer direct-secret\r\ncookie: session=session-secret\r\n\r\n",
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
         let response = String::from_utf8_lossy(&response);
         assert!(response.contains("501 Not Implemented"));
-        assert!(response.contains("mitm_unimplemented"));
+        assert!(response.contains("mitm_http_forwarding_unimplemented"));
 
         shutdown_tx.send(true).expect("shutdown");
         task.await.expect("task").expect("serve listener");
@@ -690,6 +1071,9 @@ mod tests {
 
         let log_text = fs::read_to_string(&log_path).expect("read log");
         assert!(!log_text.contains("proxy-secret"));
+        assert!(!log_text.contains("direct-secret"));
+        assert!(!log_text.contains("session-secret"));
+        assert!(!log_text.contains("query-secret"));
         let records: Vec<Value> = read_tail_lines(&log_path, 20)
             .expect("read lines")
             .into_iter()
@@ -701,14 +1085,46 @@ mod tests {
             .expect("proxy request event");
 
         assert_eq!(event["data"]["method"], "CONNECT");
-        assert_eq!(event["data"]["target_host"], "api.openai.com");
+        assert_eq!(event["data"]["target_host"], "chatgpt.com");
         assert_eq!(event["data"]["target_port"], 443);
-        assert_eq!(event["data"]["status"], "mitm_unimplemented");
-        assert_eq!(event["data"]["connect_action"], "mitm_unimplemented");
+        assert_eq!(
+            event["data"]["status"],
+            "mitm_http_forwarding_unimplemented"
+        );
+        assert_eq!(event["data"]["connect_action"], "mitm");
         assert_eq!(
             event["data"]["auth_shape"]["proxy_authorization_present"],
             true
         );
+
+        let tls_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_tls")
+            .expect("mitm tls event");
+        assert_eq!(tls_event["data"]["target_host"], "chatgpt.com");
+        assert_eq!(tls_event["data"]["target_port"], 443);
+        assert_eq!(tls_event["data"]["status"], "handshake_ok");
+
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["target_host"], "chatgpt.com");
+        assert_eq!(request_event["data"]["target_port"], 443);
+        assert_eq!(request_event["data"]["method"], "GET");
+        assert_eq!(
+            request_event["data"]["path"],
+            "/backend-api/codex?api_key=[redacted]"
+        );
+        assert_eq!(
+            request_event["data"]["status"],
+            "mitm_http_forwarding_unimplemented"
+        );
+        assert_eq!(
+            request_event["data"]["auth_shape"]["authorization_present"],
+            true
+        );
+        assert_eq!(request_event["data"]["auth_shape"]["cookie_present"], true);
     }
 
     #[test]

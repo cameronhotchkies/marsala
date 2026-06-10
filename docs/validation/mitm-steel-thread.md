@@ -1,13 +1,13 @@
 # MITM Steel Thread Validation
 
-Status: active MITM track. Marsala can generate a local CA, validate exact-host MITM config, and select allowlisted `CONNECT` targets. Allowlisted targets currently return `mitm_unimplemented`; non-allowlisted targets tunnel. HTTPS decryption is not implemented yet.
+Status: first TLS termination proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, log sanitized `mitm_tls` handshake metadata, read the first decrypted HTTP/1.1 request headers when available, and emit sanitized `mitm_request` metadata. Upstream forwarding is not implemented yet.
 
 Observed facts:
 
 - Inbound-auth passthrough to public `api.openai.com/v1/responses` was transport-success/upstream-rejected with `401 Unauthorized`.
 - Normal ChatGPT-backed Codex succeeds through Marsala's proxy when tunneled.
 - That normal path currently emits `CONNECT` metadata for `chatgpt.com:443` and `ab.chatgpt.com:443`.
-- `github.com:443` may appear during a run and must remain tunneled unless deliberately in scope.
+- `github.com:443` may appear during a run and must remain tunneled.
 - Treat allowlisted MITM of `chatgpt.com` and `ab.chatgpt.com` as the main path for subscription-backed normal Codex traffic discovery.
 
 ## CA Generation
@@ -56,9 +56,11 @@ MARSALA__MITM__CA_KEY_PATH=certs/marsala-ca-key.pem \
   cargo run -p marsala -- config print --all
 ```
 
-Expected today: config prints successfully. This proves only config acceptance, not interception.
+Expected today: config prints successfully.
 
-## Current CONNECT Baseline
+Use `api.openai.com` as an optional allowlist host only when validating the API/custom-provider path.
+
+## TLS Termination Proof
 
 Start Marsala with the proxy and MITM config accepted:
 
@@ -76,7 +78,7 @@ In another terminal, run normal Codex through the proxy:
 ```bash
 env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
   HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-  CODEX_CA_CERTIFICATE="$PWD/certs/marsala-ca.pem" \
+  SSL_CERT_FILE="$PWD/certs/marsala-ca.pem" \
   codex exec \
     --skip-git-repo-check \
     -c 'approval_policy="never"' \
@@ -86,15 +88,15 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
 Expected today:
 
 - `proxy_request` entries with `method=CONNECT`, `target_host=chatgpt.com` or `target_host=ab.chatgpt.com`, and `target_port=443`.
-- If those hosts are allowlisted and TLS termination is still missing, `status=mitm_unimplemented`.
-- If MITM is disabled or the hosts are not allowlisted, `connect_action=tunnel` and `status=closed` or `status=error`.
-- No visible `/v1/responses` path from inside the tunnel.
-- No `mitm_request` event.
-- `CODEX_CA_CERTIFICATE` points at a generated CA, but this slice does not terminate TLS or decrypt traffic yet.
+- For allowlisted ChatGPT hosts, `connect_action=mitm`.
+- `mitm_tls` with the same exact host and `status=handshake_ok`, or `status=error` if the client does not trust the generated CA.
+- `mitm_request` with sanitized `method`, redacted `path`, and `auth_shape` for the first decrypted HTTP/1.1 request if the client sends one.
+- The client receives local `501 mitm_http_forwarding_unimplemented` because upstream forwarding is not implemented in this proof.
+- Non-allowlisted HTTPS targets, including observed `github.com` traffic, still tunnel and do not produce `mitm_tls` or `mitm_request`.
 
-## Future MITM Proof
+## CA Fallback
 
-After TLS termination is implemented, start Marsala the same way and run normal Codex with the Marsala CA:
+If a client does not honor `CODEX_CA_CERTIFICATE`, test the generic CA variable separately:
 
 ```bash
 env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
@@ -106,23 +108,17 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
     'Reply with one short sentence.'
 ```
 
-If a client does not honor `CODEX_CA_CERTIFICATE`, test the generic CA variable separately:
+## Remaining Full-MITM Gap
 
-```bash
-env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
-  HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-  SSL_CERT_FILE="$PWD/certs/marsala-ca.pem" \
-  codex exec \
-    --skip-git-repo-check \
-    -c 'approval_policy="never"' \
-    'Reply with one short sentence.'
-```
+The current proof terminates downstream TLS and observes the first HTTP/1.1 request headers, then returns local `501 mitm_http_forwarding_unimplemented`.
 
-Expected future proof:
+Still missing:
 
-- `proxy_request` shows the allowlisted `CONNECT`.
-- `mitm_request` shows `host=chatgpt.com` or `host=ab.chatgpt.com`, `method`, redacted `path`, and upstream `status`.
-- `logs/events.jsonl` contains no raw bearer token, cookie, request body, response body, or stream chunk content.
-- Non-allowlisted HTTPS targets still tunnel and do not produce `mitm_request`.
+- upstream TLS connection and request forwarding
+- HTTP response forwarding
+- request/response body policy and streaming support
+- explicit HTTP/2 handling beyond safe unsupported logging
 
-Do not claim payload interception until this future proof succeeds on a normal Codex run.
+Safety invariant: `logs/events.jsonl` must contain no raw bearer token, cookie, request body, response body, or stream chunk content.
+
+Do not claim full Codex MITM until upstream forwarding is implemented and a normal Codex run succeeds through the terminated TLS path.

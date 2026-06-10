@@ -17,11 +17,12 @@ config = { version = "=0.15.11", default-features = false, features = ["toml"] }
 futures-core = "0.3"
 futures-util = "0.3"
 reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls", "stream"] }
-rcgen = "=0.14.8"
+rcgen = { version = "=0.14.8", features = ["x509-parser"] }
 rustls-pemfile = "=2.2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"

@@ -16,7 +16,7 @@ mitm-ca-init:
     cargo run -p marsala -- mitm ca init
 
 mitm-serve:
-    MARSALA__PROXY__ENABLED=true MARSALA__MITM__ENABLED=true MARSALA__MITM__ALLOW_HOSTS=api.openai.com cargo run -p marsala -- serve
+    MARSALA__PROXY__ENABLED=true MARSALA__MITM__ENABLED=true MARSALA__MITM__ALLOW_HOSTS=chatgpt.com,ab.chatgpt.com cargo run -p marsala -- serve
 
 logs:
     cargo run -p marsala -- logs tail --lines 80 --follow
