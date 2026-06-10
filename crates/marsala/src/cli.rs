@@ -31,6 +31,8 @@ pub enum Command {
     Config(ConfigArgs),
     #[command(about = "Read JSONL event logs")]
     Logs(LogsArgs),
+    #[command(about = "Manage allowlisted MITM foundation assets")]
+    Mitm(MitmArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -55,6 +57,30 @@ pub struct LogsArgs {
 pub enum LogsCommand {
     #[command(about = "Print recent log lines and optionally keep following")]
     Tail(TailArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MitmArgs {
+    #[command(subcommand)]
+    pub command: MitmCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum MitmCommand {
+    #[command(about = "Manage the local Marsala CA")]
+    Ca(CaArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CaArgs {
+    #[command(subcommand)]
+    pub command: CaCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CaCommand {
+    #[command(about = "Generate the local Marsala CA without overwriting existing files")]
+    Init,
 }
 
 #[derive(Debug, Clone, Args)]

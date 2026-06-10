@@ -1,6 +1,23 @@
 # MITM Steel Thread Validation
 
-Status: validation plan. Marsala currently validates MITM config and tunnels HTTPS `CONNECT`; it does not decrypt HTTPS payloads yet.
+Status: foundation slice. Marsala can generate a local CA and validate exact-host MITM config, but still tunnels HTTPS `CONNECT`; it does not decrypt HTTPS payloads yet.
+
+## CA Generation
+
+Generate the default local CA paths:
+
+```bash
+cargo run -p marsala -- mitm ca init
+```
+
+Expected today:
+
+- Creates `certs/marsala-ca.pem`.
+- Creates `certs/marsala-ca-key.pem`.
+- Creates `certs/` with restrictive permissions where supported on Unix.
+- Refuses to overwrite either file if it already exists.
+
+The default `certs/` directory is gitignored and must not be committed.
 
 ## Current Config Validation
 
@@ -52,6 +69,7 @@ In another terminal, run normal Codex through the proxy:
 ```bash
 env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
   HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+  CODEX_CA_CERTIFICATE="$PWD/certs/marsala-ca.pem" \
   CODEX_API_KEY="${OPENAI_API_KEY:-sk-local-probe}" \
   codex exec \
     -c 'openai_base_url="https://api.openai.com/v1"' \
@@ -65,10 +83,11 @@ Expected today:
 - `status=closed` or `status=error`.
 - No visible `/v1/responses` path from inside the tunnel.
 - No `mitm_request` event.
+- `CODEX_CA_CERTIFICATE` points at a generated CA, but this slice does not terminate TLS or decrypt traffic yet.
 
 ## Future MITM Proof
 
-After CA generation/export and TLS termination are implemented, start Marsala the same way and run normal Codex with the Marsala CA:
+After TLS termination is implemented, start Marsala the same way and run normal Codex with the Marsala CA:
 
 ```bash
 env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \

@@ -137,8 +137,39 @@ MITM foundation settings:
 - `mitm.enabled=false` keeps TLS interception off by default
 - `mitm.default_action="tunnel"` is the only supported default action in this foundation
 - `mitm.allow_hosts` must contain exact hostnames only, such as `api.openai.com` or `chatgpt.com`; URLs, ports, and wildcards are rejected
-- `mitm.ca_cert_path` and `mitm.ca_key_path` define the local CA paths for the planned CA generation/export command
-- `mitm.enabled=true` currently validates config only and requires `proxy.enabled=true` plus a non-empty allowlist; it does not decrypt traffic yet
+- `mitm.ca_cert_path` and `mitm.ca_key_path` define where `marsala mitm ca init` writes the local CA certificate and private key
+- `mitm.enabled=true` currently validates config and enables the exact-host allowlist decision helper; this slice still tunnels `CONNECT` traffic and does not decrypt HTTPS payloads yet
+
+Generate the local Marsala CA without overwriting existing files:
+
+```bash
+cargo run -p marsala -- mitm ca init
+```
+
+Run Marsala with the proxy and an exact MITM allowlist:
+
+```bash
+MARSALA__PROXY__ENABLED=true \
+MARSALA__MITM__ENABLED=true \
+MARSALA__MITM__ALLOW_HOSTS=api.openai.com,chatgpt.com \
+MARSALA__MITM__CA_CERT_PATH=certs/marsala-ca.pem \
+MARSALA__MITM__CA_KEY_PATH=certs/marsala-ca-key.pem \
+  cargo run -p marsala -- serve
+```
+
+Run normal Codex through Marsala's HTTPS proxy and point Codex at the generated CA:
+
+```bash
+env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
+  HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+  CODEX_CA_CERTIFICATE="$PWD/certs/marsala-ca.pem" \
+  codex exec \
+    -c 'openai_base_url="https://api.openai.com/v1"' \
+    -c 'model="gpt-5"' \
+    'Reply with one short sentence.'
+```
+
+Expected for this slice: Marsala logs the `CONNECT` metadata and tunnels the HTTPS connection. The generated CA and `CODEX_CA_CERTIFICATE` prepare the trust path, but no decrypted request path, body, stream chunk, or `mitm_request` event is produced yet.
 
 See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
 See [docs/planning/05_mitm_foundation.md](docs/planning/05_mitm_foundation.md) for the planned allowlisted MITM steel thread and Rust stack.
@@ -163,3 +194,4 @@ The container overrides a runtime setting:
 - `config print --all`: include roadmap sections such as `openai`, `rewrite`, `tool_capture`, `proxy`, and `mitm`
 - `logs tail`: print the last JSONL entries, with optional `--follow`
 - `logs tail --follow`: prints one waiting message to stderr when `logs/events.jsonl` does not exist yet, then resumes on file creation or recreation
+- `mitm ca init`: generate `mitm.ca_cert_path` and `mitm.ca_key_path` without overwriting existing files

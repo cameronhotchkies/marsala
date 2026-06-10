@@ -1,3 +1,4 @@
+pub mod certs;
 pub mod cli;
 pub mod config;
 pub mod event_log;
@@ -10,7 +11,7 @@ use std::{future::IntoFuture, sync::Once, time::Duration};
 use anyhow::{Context, Result};
 use axum::serve;
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, LogsCommand};
+use cli::{CaCommand, Cli, Command, ConfigCommand, LogsCommand, MitmCommand};
 use config::AppConfig;
 use event_log::EventLogWriter;
 use tokio::{net::TcpListener, sync::watch};
@@ -43,6 +44,20 @@ pub async fn run() -> Result<()> {
             LogsCommand::Tail(args) => {
                 event_log::tail_log_file(&config.logging.path, args.lines, args.follow).await
             }
+        },
+        Command::Mitm(args) => match args.command {
+            MitmCommand::Ca(args) => match args.command {
+                CaCommand::Init => {
+                    let created = certs::init_ca(&config.mitm)?;
+                    println!("created CA certificate: {}", created.cert_path.display());
+                    println!("created CA private key: {}", created.key_path.display());
+                    println!(
+                        "trust for Codex with: CODEX_CA_CERTIFICATE={}",
+                        created.cert_path.display()
+                    );
+                    Ok(())
+                }
+            },
         },
     }
 }

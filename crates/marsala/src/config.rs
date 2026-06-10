@@ -80,6 +80,10 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         self.mitm.validate(&self.proxy)
     }
+
+    pub fn mitm_connect_action_for_host(&self, host: &str) -> MitmConnectAction {
+        self.mitm.connect_action_for_host(&self.proxy, host)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -263,6 +267,26 @@ impl MitmConfig {
 
         Ok(())
     }
+
+    pub fn connect_action_for_host(&self, proxy: &ProxyConfig, host: &str) -> MitmConnectAction {
+        if proxy.enabled
+            && self.enabled
+            && self
+                .allow_hosts
+                .iter()
+                .any(|allow_host| allow_host.as_str() == host)
+        {
+            MitmConnectAction::Mitm
+        } else {
+            MitmConnectAction::Tunnel
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitmConnectAction {
+    Mitm,
+    Tunnel,
 }
 
 fn validate_mitm_allow_host(host: &str) -> Result<()> {
@@ -550,6 +574,45 @@ allow_hosts = ["{host}"]
                 "expected invalid host to fail: {host}"
             );
         }
+    }
+
+    #[test]
+    fn mitm_connect_action_requires_proxy_enabled_mitm_enabled_and_exact_host() {
+        let proxy_enabled = ProxyConfig {
+            enabled: true,
+            ..ProxyConfig::default()
+        };
+        let proxy_disabled = ProxyConfig::default();
+        let mitm_enabled = MitmConfig {
+            enabled: true,
+            allow_hosts: vec!["api.openai.com".to_string()],
+            ..MitmConfig::default()
+        };
+        let mitm_disabled = MitmConfig {
+            allow_hosts: vec!["api.openai.com".to_string()],
+            ..MitmConfig::default()
+        };
+
+        assert_eq!(
+            mitm_enabled.connect_action_for_host(&proxy_enabled, "api.openai.com"),
+            MitmConnectAction::Mitm
+        );
+        assert_eq!(
+            mitm_enabled.connect_action_for_host(&proxy_enabled, "chatgpt.com"),
+            MitmConnectAction::Tunnel
+        );
+        assert_eq!(
+            mitm_enabled.connect_action_for_host(&proxy_enabled, "sub.api.openai.com"),
+            MitmConnectAction::Tunnel
+        );
+        assert_eq!(
+            mitm_enabled.connect_action_for_host(&proxy_disabled, "api.openai.com"),
+            MitmConnectAction::Tunnel
+        );
+        assert_eq!(
+            mitm_disabled.connect_action_for_host(&proxy_enabled, "api.openai.com"),
+            MitmConnectAction::Tunnel
+        );
     }
 
     #[test]
