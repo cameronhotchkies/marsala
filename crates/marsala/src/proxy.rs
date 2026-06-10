@@ -51,6 +51,7 @@ const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_WEBSOCKET_INSPECT_BUFFER_BYTES: usize = 1024 * 1024;
 const WEBSOCKET_DEFLATE_PREVIEW_SAFETY_BYTES: usize = 1024;
+const WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES: usize = 1024 * 1024;
 
 pub async fn serve(
     config: AppConfig,
@@ -2120,26 +2121,64 @@ impl WebSocketFrameInspector {
         let mut compressed = Vec::with_capacity(payload.len() + 4);
         compressed.extend_from_slice(payload);
         compressed.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
-        let inflated_cap = preview_cap
+        let retain_cap = preview_cap
             .saturating_add(WEBSOCKET_DEFLATE_PREVIEW_SAFETY_BYTES)
             .max(1);
-        let mut decoded = vec![0u8; inflated_cap];
-        let before_in = decompressor.total_in();
-        let before_out = decompressor.total_out();
-        let status = match decompressor.decompress(&compressed, &mut decoded, FlushDecompress::Sync)
-        {
-            Ok(status) => status,
-            Err(error) => {
-                self.decompressor = None;
-                return Err(format!("deflate_decode_failed: {error}"));
+        let inflated_cap = WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES.max(retain_cap);
+        let mut decoded = Vec::with_capacity(retain_cap.min(8192));
+        let mut consumed = 0usize;
+        let mut inflated = 0usize;
+        let mut hit_inflated_cap = false;
+
+        loop {
+            let remaining_cap = inflated_cap.saturating_sub(inflated);
+            if remaining_cap == 0 {
+                hit_inflated_cap = true;
+                break;
             }
-        };
-        let consumed = (decompressor.total_in() - before_in) as usize;
-        let written = (decompressor.total_out() - before_out) as usize;
-        decoded.truncate(written.min(inflated_cap));
-        let truncated =
-            written >= inflated_cap || (status != Status::StreamEnd && consumed < compressed.len());
-        if no_context_takeover || truncated {
+
+            let mut out = [0u8; 8192];
+            let out_len = out.len().min(remaining_cap);
+            let before_in = decompressor.total_in();
+            let before_out = decompressor.total_out();
+            let status = match decompressor.decompress(
+                &compressed[consumed..],
+                &mut out[..out_len],
+                FlushDecompress::Sync,
+            ) {
+                Ok(status) => status,
+                Err(error) => {
+                    self.decompressor = None;
+                    return Err(format!("deflate_decode_failed: {error}"));
+                }
+            };
+
+            let read = (decompressor.total_in() - before_in) as usize;
+            let written = (decompressor.total_out() - before_out) as usize;
+            consumed = consumed.saturating_add(read);
+            inflated = inflated.saturating_add(written);
+
+            if decoded.len() < retain_cap {
+                let remaining_retain = retain_cap - decoded.len();
+                decoded.extend_from_slice(&out[..written.min(remaining_retain)]);
+            }
+
+            if status == Status::StreamEnd {
+                break;
+            }
+
+            if read == 0 && written == 0 {
+                break;
+            }
+
+            if consumed >= compressed.len() && written == 0 {
+                break;
+            }
+        }
+
+        let truncated = inflated > preview_cap || hit_inflated_cap;
+        decoded.truncate(decoded.len().min(retain_cap));
+        if no_context_takeover || hit_inflated_cap {
             self.decompressor = None;
         }
         Ok(BoundedInflatePreview {
@@ -3945,6 +3984,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mitm_websocket_capture_preserves_deflate_context_after_truncated_preview() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut logging = LoggingConfig::default();
+        logging.capture_mitm_websocket_frames = true;
+        logging.mitm_websocket_frame_preview_bytes = 128;
+        let fixture = spawn_allowlisted_mitm_proxy_with_logging(&tempdir, logging).await;
+
+        let mut compressor = flate2::Compress::new(flate2::Compression::fast(), false);
+        let first_frame = websocket_client_context_compressed_text_frame(
+            &mut compressor,
+            &format!("instructions={}", "read-codebase-first;".repeat(512)),
+        );
+        let second_frame = websocket_client_context_compressed_text_frame(
+            &mut compressor,
+            r#"{"input":[{"role":"user","content":"Reply with one short sentence."}]}"#,
+        );
+        let mut expected_client_bytes = first_frame.clone();
+        expected_client_bytes.extend_from_slice(&second_frame);
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101_with_response_headers(
+                expected_client_bytes,
+                Vec::new(),
+                "sec-websocket-extensions: permessage-deflate\r\n",
+            )
+            .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\nsec-websocket-extensions: permessage-deflate\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let response_head = read_http_response_head(&mut tls).await;
+        assert!(response_head.contains("101 Switching Protocols"));
+        tls.write_all(&first_frame)
+            .await
+            .expect("write first compressed websocket frame");
+        tls.write_all(&second_frame)
+            .await
+            .expect("write second compressed websocket frame");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+
+        let records = read_json_records(&log_path);
+        let request_texts: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record["event_type"] == "mitm_websocket_frame"
+                    && record["data"]["direction"] == "request"
+                    && record["data"]["opcode"] == "text"
+            })
+            .collect();
+        assert_eq!(request_texts.len(), 2);
+        assert_eq!(
+            request_texts[0]["data"]["preview_status"],
+            "decoded_truncated"
+        );
+        assert!(matches!(
+            request_texts[1]["data"]["preview_status"].as_str(),
+            Some("decoded" | "decoded_truncated")
+        ));
+        let second_preview = request_texts[1]["data"]["preview"]
+            .as_str()
+            .expect("second decoded preview");
+        assert!(second_preview.contains("Reply with one short sentence."));
+    }
+
+    #[tokio::test]
     async fn mitm_websocket_capture_omits_preview_when_compressed_decode_fails() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut logging = LoggingConfig::default();
@@ -4506,6 +4621,17 @@ mod tests {
         )
     }
 
+    fn websocket_client_context_compressed_text_frame(
+        compressor: &mut flate2::Compress,
+        payload: &str,
+    ) -> Vec<u8> {
+        websocket_frame_with_rsv1(
+            0x1,
+            &permessage_deflate_payload_with_compressor(compressor, payload.as_bytes()),
+            Some([0x21, 0x32, 0x43, 0x54]),
+        )
+    }
+
     fn websocket_client_binary_frame(payload: &[u8]) -> Vec<u8> {
         websocket_frame(0x2, payload, Some([0x55, 0x66, 0x77, 0x88]))
     }
@@ -4550,6 +4676,13 @@ mod tests {
 
     fn permessage_deflate_payload(payload: &[u8]) -> Vec<u8> {
         let mut compressor = flate2::Compress::new(flate2::Compression::fast(), false);
+        permessage_deflate_payload_with_compressor(&mut compressor, payload)
+    }
+
+    fn permessage_deflate_payload_with_compressor(
+        compressor: &mut flate2::Compress,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut compressed = Vec::with_capacity(payload.len() + 16);
         compressor
             .compress_vec(payload, &mut compressed, flate2::FlushCompress::Sync)
