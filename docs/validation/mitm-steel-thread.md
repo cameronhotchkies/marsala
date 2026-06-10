@@ -2,6 +2,8 @@
 
 Status: foundation slice. Marsala can generate a local CA and validate exact-host MITM config, but still tunnels HTTPS `CONNECT`; it does not decrypt HTTPS payloads yet.
 
+Inbound-auth passthrough to public `api.openai.com/v1/responses` has been observed as transport-success/upstream-rejected with `401 Unauthorized`. Unless MITM discovers a different upstream host or path, treat allowlisted MITM as the main path for subscription-backed normal Codex traffic discovery.
+
 ## CA Generation
 
 Generate the default local CA paths:

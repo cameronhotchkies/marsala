@@ -1,6 +1,6 @@
 # Codex Acquisition Probe
 
-This note validates Marsala as an explicit Codex Responses gateway and metadata-only proxy probe. It validates `/v1/responses` forwarding through the configured custom-provider/base-URL path, including HTTP streaming passthrough when Codex sends `stream=true`. It does not validate WebSocket forwarding or TLS interception.
+This note validates Marsala as an explicit Codex Responses gateway and metadata-only proxy probe. It validates `/v1/responses` forwarding through the configured custom-provider/base-URL path, including HTTP streaming passthrough when Codex sends `stream=true`. It also records the inbound-auth passthrough result for public `api.openai.com`: transport succeeds, but upstream returns `401 Unauthorized`. It does not validate WebSocket forwarding or TLS interception.
 
 ## Start Marsala
 
@@ -69,7 +69,9 @@ Expected Marsala events:
 
 ## Custom Provider With Codex Auth Passthrough
 
-This is an empirical spike, not a claimed success path. In `openai.auth_mode=inbound_authorization`, Marsala forwards the inbound `Authorization` header upstream for `POST /v1/responses` instead of loading `openai.api_key_env`. If Codex sends a ChatGPT/Codex session token and OpenAI rejects it on the public Responses API, document that result as an upstream auth rejection.
+This is an empirical spike, not a claimed success path. In `openai.auth_mode=inbound_authorization`, Marsala forwards the inbound `Authorization` header upstream for `POST /v1/responses` instead of loading `openai.api_key_env`.
+
+Observed Path A result for public `api.openai.com`: Marsala forwards the inbound ChatGPT/Codex auth header successfully, then upstream returns `401 Unauthorized`. Treat that as transport-success/upstream-rejected unless future MITM inspection discovers a different upstream host or path for subscription-backed normal Codex traffic.
 
 Start Marsala without requiring `CODEX_API_KEY` or `OPENAI_API_KEY` in Marsala's environment:
 
@@ -95,7 +97,7 @@ env -u CODEX_API_KEY -u OPENAI_API_KEY \
 Expected Marsala events if Codex sends auth:
 
 - `responses_request` with `path=/v1/responses`, `target=upstream`, `auth_mode=inbound_authorization`, `auth_shape.authorization_present=true`, `upstream_headers.authorization=[redacted]`, `upstream_headers.authorization_source=inbound_authorization`, and no `api_key_env`.
-- `responses_response` with the actual upstream status. `2xx` means the token was accepted for this path. `401` or `403` means the passthrough transport worked but upstream rejected the token.
+- `responses_response` with `status=401` for the observed public `api.openai.com/v1/responses` path. A future `2xx` would mean the token was accepted for a discovered path; `401` or `403` means the passthrough transport worked but upstream rejected the token.
 
 Expected local failure if Codex does not send auth:
 
@@ -182,5 +184,6 @@ Expected: direct `responses_request`; no `proxy_request`.
 - Plain HTTP proxy forwarding is not implemented; it logs metadata and returns local `501`.
 - HTTPS `CONNECT` is tunneled without MITM, decryption, request body capture, or response body capture.
 - Marsala cannot observe `/v1/responses` paths inside HTTPS tunnels without future opt-in MITM support.
+- Inbound-auth passthrough to public `api.openai.com` is not the subscription-backed normal Codex success path as currently observed; allowlisted MITM is the main path for discovering the real upstream shape.
 
 See [mitm-steel-thread.md](mitm-steel-thread.md) for the planned allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY` and `CODEX_CA_CERTIFICATE`.

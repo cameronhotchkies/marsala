@@ -105,7 +105,7 @@ CODEX_API_KEY=sk-local-routed-through-marsala codex exec \
 
 Codex sends the local request with the configured custom-provider env key. Marsala forwards upstream using `openai.api_key_env` from its own environment, defaulting to `OPENAI_API_KEY`; inbound `Authorization` is logged only as redacted shape metadata and is not forwarded.
 
-Codex-auth passthrough spike. This mode is empirical: it validates whether Codex will send OpenAI/Codex auth to a custom provider and whether OpenAI accepts that token on the upstream Responses API. Marsala can forward the header, but success depends on upstream accepting the token shape.
+Codex-auth passthrough spike. This mode is empirical: it validates whether Codex will send OpenAI/Codex auth to a custom provider and whether OpenAI accepts that token on the upstream Responses API. The observed `api.openai.com` result is transport-success/upstream-rejected: Marsala forwards the inbound auth header to `POST /v1/responses`, and upstream returns `401 Unauthorized`. Treat that as the expected Path A result unless future MITM inspection discovers a different upstream host or path for subscription-backed normal Codex traffic.
 
 ```bash
 MARSALA__OPENAI__AUTH_MODE=inbound_authorization cargo run -p marsala -- serve
@@ -122,7 +122,7 @@ env -u CODEX_API_KEY -u OPENAI_API_KEY \
     'Reply with one short sentence.'
 ```
 
-Expected local validation: Marsala logs `responses_request` with `auth_mode=inbound_authorization`, `auth_shape.authorization_present=true`, redacted upstream authorization metadata, and no raw token/body/chunk content by default. If upstream rejects the forwarded ChatGPT/Codex token, treat that as the spike result; do not interpret passthrough transport as API authorization success.
+Expected local validation: Marsala logs `responses_request` with `auth_mode=inbound_authorization`, `auth_shape.authorization_present=true`, redacted upstream authorization metadata, and no raw token/body/chunk content by default. For the public `api.openai.com/v1/responses` path, expect `responses_response` with `status=401`; do not interpret passthrough transport as API authorization success.
 
 Proxy probe settings:
 
@@ -139,6 +139,7 @@ MITM foundation settings:
 - `mitm.allow_hosts` must contain exact hostnames only, such as `api.openai.com` or `chatgpt.com`; URLs, ports, and wildcards are rejected
 - `mitm.ca_cert_path` and `mitm.ca_key_path` define where `marsala mitm ca init` writes the local CA certificate and private key
 - `mitm.enabled=true` currently validates config and enables the exact-host allowlist decision helper; this slice still tunnels `CONNECT` traffic and does not decrypt HTTPS payloads yet
+- MITM is now the main path for discovering the real subscription-backed normal Codex upstream shape, because inbound-auth passthrough to public `api.openai.com` has been observed to return `401 Unauthorized`
 
 Generate the local Marsala CA without overwriting existing files:
 
