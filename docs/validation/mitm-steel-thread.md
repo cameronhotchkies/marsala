@@ -1,6 +1,6 @@
 # MITM Steel Thread Validation
 
-Status: HTTP/1.1 forwarding proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, forward decrypted HTTP/1.1 requests upstream over verified TLS to the same host:port, copy upstream responses back downstream within the current operation timeout, and emit sanitized `mitm_tls`, `mitm_request`, and `mitm_response` metadata.
+Status: HTTP/1.1 forwarding proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, forward decrypted HTTP/1.1 requests upstream over verified TLS to the same host:port, forward allowlisted HTTP/1.1 WebSocket upgrades, tunnel bytes after upstream `101 Switching Protocols` without frame inspection, and emit sanitized `mitm_tls`, `mitm_request`, and `mitm_response` metadata.
 
 Observed facts:
 
@@ -90,10 +90,11 @@ Expected today:
 - `proxy_request` entries with `method=CONNECT`, `target_host=chatgpt.com` or `target_host=ab.chatgpt.com`, and `target_port=443`.
 - For allowlisted ChatGPT hosts, `connect_action=mitm`.
 - `mitm_tls` with the same exact host and `status=handshake_ok`, or `status=error` if the client does not trust the generated CA.
-- `mitm_request` with sanitized `method`, redacted `path`, `auth_shape`, and bounded request byte counts for decrypted HTTP/1.1 requests.
-- `mitm_response` with upstream status and response byte counts when forwarding reaches the upstream server and the response body finishes before the steel-thread timeout.
+- `mitm_request` with sanitized `method`, redacted `path`, `auth_shape`, and bounded request byte counts for decrypted HTTP/1.1 requests; WebSocket upgrades use `status=websocket_forwarded`.
+- `mitm_response` with upstream status and response byte counts when forwarding reaches the upstream server and the response body finishes before the steel-thread timeout; WebSocket `101` responses include `upstream_status=101` and `websocket_tunnel_status`.
 - The client receives the upstream HTTP/1.1 response when the request has no body or a `Content-Length` body up to 1 MiB and the response body copy does not exceed the current operation timeout.
-- HTTP/2, WebSocket upgrades, and request `Transfer-Encoding` streaming are logged as explicit unsupported MITM statuses.
+- HTTP/1.1 WebSocket upgrades to the same CONNECT host:port are forwarded over verified upstream TLS; after upstream `101 Switching Protocols`, Marsala tunnels bytes bidirectionally without inspecting or logging frames.
+- HTTP/2, malformed upgrades, non-WebSocket upgrades, and request `Transfer-Encoding` streaming are logged as explicit unsupported or malformed MITM statuses.
 - Stalled upstream response bodies are logged with `response_body_timeout`; this proof does not provide unbounded response streaming.
 - Non-allowlisted HTTPS targets, including observed `github.com` traffic, still tunnel and do not produce `mitm_tls` or `mitm_request`.
 
@@ -113,15 +114,15 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
 
 ## Remaining Full-MITM Gap
 
-The current proof terminates downstream TLS and forwards HTTP/1.1 requests/responses without logging bodies or chunks. Response body forwarding is bounded by the current operation timeout.
+The current proof terminates downstream TLS and forwards HTTP/1.1 requests/responses and allowlisted HTTP/1.1 WebSocket upgrade tunnels without logging bodies, chunks, or frame bytes. Response body forwarding is bounded by the current operation timeout.
 
 Still missing:
 
 - HTTP/2 forwarding
-- WebSocket forwarding
+- WebSocket forwarding outside the exact allowlisted HTTP/1.1 upgrade steel thread
 - request body streaming for chunked or otherwise unbounded bodies
 - validation that a normal ChatGPT-backed Codex run stays on HTTP/1.1 and succeeds through the terminated TLS path
 
-Safety invariant: `logs/events.jsonl` must contain no raw bearer token, cookie, request body, response body, or stream chunk content.
+Safety invariant: `logs/events.jsonl` must contain no raw bearer token, cookie, request body, response body, stream chunk content, or WebSocket frame bytes.
 
 Do not claim full Codex MITM until a normal Codex run succeeds through the terminated TLS path.

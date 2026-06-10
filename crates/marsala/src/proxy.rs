@@ -417,6 +417,7 @@ async fn handle_mitm_connect(
                                     upstream_status: response.upstream_status,
                                     response_header_bytes: response.response_header_bytes,
                                     response_body_bytes: response.response_body_bytes,
+                                    websocket_tunnel_status: response.websocket_tunnel_status,
                                     error: response.error.clone(),
                                 },
                             );
@@ -458,6 +459,7 @@ async fn handle_mitm_connect(
                                 upstream_status: None,
                                 response_header_bytes: None,
                                 response_body_bytes: None,
+                                websocket_tunnel_status: None,
                                 error: Some(message.clone()),
                             },
                         );
@@ -721,6 +723,7 @@ struct MitmResponseEvent<'a> {
     upstream_status: Option<u16>,
     response_header_bytes: Option<u64>,
     response_body_bytes: Option<u64>,
+    websocket_tunnel_status: Option<&'a str>,
     error: Option<String>,
 }
 
@@ -747,6 +750,12 @@ fn emit_mitm_response_event(event_log: &EventLogHandle, event: MitmResponseEvent
     }
     if let Some(response_body_bytes) = event.response_body_bytes {
         data.insert("response_body_bytes".into(), response_body_bytes.into());
+    }
+    if let Some(websocket_tunnel_status) = event.websocket_tunnel_status {
+        data.insert(
+            "websocket_tunnel_status".into(),
+            websocket_tunnel_status.into(),
+        );
     }
     if let Some(error) = event.error {
         data.insert("error".into(), error.into());
@@ -870,19 +879,35 @@ where
         return Ok(MitmForwardResult::rejected("authority_mismatch", message));
     }
 
-    if is_websocket_upgrade(request) {
+    if unsupported_http_upgrade_request(request) {
         write_mitm_http_error_response(
             downstream.get_mut(),
             501,
             "Not Implemented",
-            "mitm_websocket_unsupported",
-            "Marsala MITM WebSocket forwarding is not implemented",
+            "mitm_upgrade_unsupported",
+            "Marsala MITM supports only HTTP/1.1 WebSocket upgrades in this steel thread",
         )
         .await?;
         return Ok(MitmForwardResult::rejected(
-            "websocket_unsupported",
-            "MITM WebSocket forwarding is not implemented",
+            "upgrade_unsupported",
+            "only WebSocket HTTP/1.1 upgrade forwarding is implemented",
         ));
+    }
+
+    if websocket_upgrade_attempt(request) {
+        if let Err(message) = validate_websocket_upgrade_request(request) {
+            write_mitm_http_error_response(
+                downstream.get_mut(),
+                400,
+                "Bad Request",
+                "mitm_websocket_malformed",
+                "Marsala rejected a malformed WebSocket upgrade request",
+            )
+            .await?;
+            return Ok(MitmForwardResult::rejected("websocket_malformed", message));
+        }
+
+        return forward_mitm_websocket_upgrade(downstream, host, port, request).await;
     }
 
     if header_value(&request.headers, "transfer-encoding").is_some() {
@@ -998,6 +1023,7 @@ where
                     upstream_status: Some(response.status_code),
                     response_header_bytes: Some(response.header_bytes as u64),
                     response_body_bytes: None,
+                    websocket_tunnel_status: None,
                     error: Some(message.to_string()),
                 }),
                 proxy_status: "response_body_timeout",
@@ -1015,10 +1041,123 @@ where
             upstream_status: Some(response.status_code),
             response_header_bytes: Some(response.header_bytes as u64),
             response_body_bytes: Some(response_body_bytes),
+            websocket_tunnel_status: None,
             error: None,
         }),
         proxy_status: "forwarded",
         proxy_error: None,
+    })
+}
+
+async fn forward_mitm_websocket_upgrade<S>(
+    downstream: &mut BufReader<S>,
+    host: &str,
+    port: u16,
+    request: &ProxyRequest,
+) -> Result<MitmForwardResult>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut upstream = connect_upstream_tls(host, port).await?;
+    write_upstream_websocket_request(&mut upstream, host, port, request).await?;
+    flush_buffered_reader_bytes(downstream, &mut upstream)
+        .await
+        .context("failed to forward buffered WebSocket client bytes upstream")?;
+
+    let mut upstream_reader = BufReader::new(upstream);
+    let response = timeout(
+        MITM_RESPONSE_HEADER_READ_TIMEOUT,
+        read_http_response(&mut upstream_reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out while reading MITM upstream response headers"))??;
+
+    if response.status_code != 101 {
+        let response_header = serialize_downstream_response(&response);
+        downstream
+            .get_mut()
+            .write_all(response_header.as_bytes())
+            .await
+            .context("failed to write MITM WebSocket non-101 response headers downstream")?;
+        let response_body_bytes = match timeout(
+            MITM_RESPONSE_BODY_COPY_TIMEOUT,
+            io::copy(&mut upstream_reader, downstream.get_mut()),
+        )
+        .await
+        {
+            Ok(Ok(response_body_bytes)) => response_body_bytes,
+            Ok(Err(error)) => {
+                return Err(error)
+                    .context("failed to stream MITM WebSocket non-101 response body downstream")
+            }
+            Err(_) => {
+                let message = "timed out while streaming MITM WebSocket non-101 response body";
+                return Ok(MitmForwardResult {
+                    request_status: "websocket_forwarded",
+                    request_body_bytes: 0,
+                    request_error: None,
+                    response: Some(MitmResponseResult {
+                        status: "websocket_non_101_response_body_timeout",
+                        upstream_status: Some(response.status_code),
+                        response_header_bytes: Some(response.header_bytes as u64),
+                        response_body_bytes: None,
+                        websocket_tunnel_status: None,
+                        error: Some(message.to_string()),
+                    }),
+                    proxy_status: "websocket_non_101_response_body_timeout",
+                    proxy_error: Some(message.to_string()),
+                });
+            }
+        };
+
+        return Ok(MitmForwardResult {
+            request_status: "websocket_forwarded",
+            request_body_bytes: 0,
+            request_error: None,
+            response: Some(MitmResponseResult {
+                status: "websocket_non_101_response",
+                upstream_status: Some(response.status_code),
+                response_header_bytes: Some(response.header_bytes as u64),
+                response_body_bytes: Some(response_body_bytes),
+                websocket_tunnel_status: None,
+                error: None,
+            }),
+            proxy_status: "websocket_non_101_response",
+            proxy_error: None,
+        });
+    }
+
+    let response_header = serialize_downstream_websocket_response(&response);
+    downstream
+        .get_mut()
+        .write_all(response_header.as_bytes())
+        .await
+        .context("failed to write MITM WebSocket 101 response headers downstream")?;
+    flush_buffered_reader_bytes(&mut upstream_reader, downstream.get_mut())
+        .await
+        .context("failed to forward buffered WebSocket upstream bytes downstream")?;
+
+    let tunnel_result =
+        io::copy_bidirectional(downstream.get_mut(), upstream_reader.get_mut()).await;
+    let (status, error) = match tunnel_result {
+        Ok(_) => ("websocket_tunnel_closed", None),
+        Err(error) => ("websocket_tunnel_error", Some(error.to_string())),
+    };
+
+    Ok(MitmForwardResult {
+        request_status: "websocket_forwarded",
+        request_body_bytes: 0,
+        request_error: None,
+        response: Some(MitmResponseResult {
+            status,
+            upstream_status: Some(response.status_code),
+            response_header_bytes: Some(response.header_bytes as u64),
+            response_body_bytes: None,
+            websocket_tunnel_status: Some(status),
+            error: error.clone(),
+        }),
+        proxy_status: status,
+        proxy_error: error,
     })
 }
 
@@ -1130,6 +1269,43 @@ where
     Ok(())
 }
 
+async fn write_upstream_websocket_request<W>(
+    upstream: &mut W,
+    host: &str,
+    port: u16,
+    request: &ProxyRequest,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let target = upstream_request_target(&request.target);
+    let mut head = format!("{} {} {}\r\n", request.method, target, request.version);
+    for (name, value) in filter_upstream_websocket_request_headers(request) {
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    if header_value(&request.headers, "host").is_none() {
+        head.push_str("host: ");
+        head.push_str(&authority_for_host_header(host, port));
+        head.push_str("\r\n");
+    }
+    let upgrade = header_value(&request.headers, "upgrade").unwrap_or_else(|| "websocket".into());
+    head.push_str("upgrade: ");
+    head.push_str(&upgrade);
+    head.push_str("\r\nconnection: Upgrade\r\n\r\n");
+    upstream
+        .write_all(head.as_bytes())
+        .await
+        .context("failed to write MITM WebSocket request headers upstream")?;
+    upstream
+        .flush()
+        .await
+        .context("failed to flush MITM WebSocket request upstream")?;
+    Ok(())
+}
+
 async fn read_http_response<R>(reader: &mut R) -> Result<HttpResponse>
 where
     R: AsyncBufRead + Unpin,
@@ -1205,6 +1381,46 @@ fn serialize_downstream_response(response: &HttpResponse) -> String {
     head
 }
 
+fn serialize_downstream_websocket_response(response: &HttpResponse) -> String {
+    let mut head = format!(
+        "{} {} {}\r\n",
+        response.version, response.status_code, response.reason
+    );
+    for (name, value) in filter_downstream_websocket_response_headers(response) {
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    let upgrade = header_value(&response.headers, "upgrade").unwrap_or_else(|| "websocket".into());
+    let connection =
+        header_value(&response.headers, "connection").unwrap_or_else(|| "Upgrade".into());
+    head.push_str("upgrade: ");
+    head.push_str(&upgrade);
+    head.push_str("\r\nconnection: ");
+    head.push_str(&connection);
+    head.push_str("\r\n\r\n");
+    head
+}
+
+async fn flush_buffered_reader_bytes<R, W>(reader: &mut BufReader<R>, writer: &mut W) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let buffered = reader.buffer().to_vec();
+    if buffered.is_empty() {
+        return Ok(0);
+    }
+
+    writer
+        .write_all(&buffered)
+        .await
+        .context("failed to write buffered bytes")?;
+    reader.consume(buffered.len());
+    Ok(buffered.len() as u64)
+}
+
 fn mitm_tls_acceptor(config: &MitmConfig, host: &str) -> Result<TlsAcceptor> {
     let server_config = mitm_server_config(config, host)?;
     Ok(TlsAcceptor::from(Arc::new(server_config)))
@@ -1273,6 +1489,55 @@ fn is_websocket_upgrade(request: &ProxyRequest) -> bool {
     header_value(&request.headers, "upgrade")
         .map(|value| value.trim().eq_ignore_ascii_case("websocket"))
         .unwrap_or(false)
+}
+
+fn websocket_upgrade_attempt(request: &ProxyRequest) -> bool {
+    is_websocket_upgrade(request)
+        || connection_header_tokens(&request.headers).contains("upgrade")
+        || request
+            .headers
+            .iter()
+            .any(|(name, _)| name.starts_with("sec-websocket-"))
+}
+
+fn unsupported_http_upgrade_request(request: &ProxyRequest) -> bool {
+    header_value(&request.headers, "upgrade")
+        .map(|value| !value.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
+fn validate_websocket_upgrade_request(
+    request: &ProxyRequest,
+) -> std::result::Result<(), &'static str> {
+    if !request.method.eq_ignore_ascii_case("GET") {
+        return Err("WebSocket upgrade request method must be GET");
+    }
+    if !is_websocket_upgrade(request) {
+        return Err("WebSocket upgrade request is missing Upgrade: websocket");
+    }
+    if !connection_header_tokens(&request.headers).contains("upgrade") {
+        return Err("WebSocket upgrade request is missing Connection: Upgrade");
+    }
+    if header_value(&request.headers, "sec-websocket-key")
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err("WebSocket upgrade request is missing Sec-WebSocket-Key");
+    }
+    if header_value(&request.headers, "sec-websocket-version")
+        .map(|value| value.trim() != "13")
+        .unwrap_or(true)
+    {
+        return Err("WebSocket upgrade request is missing Sec-WebSocket-Version: 13");
+    }
+    if header_value(&request.headers, "transfer-encoding").is_some() {
+        return Err("WebSocket upgrade request transfer-encoding is not supported");
+    }
+    match request_content_length(request) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err("WebSocket upgrade request bodies are not supported"),
+        Err(_) => Err("WebSocket upgrade request has invalid Content-Length"),
+    }
 }
 
 fn validate_mitm_request_authority(
@@ -1380,12 +1645,30 @@ fn filter_upstream_request_headers(request: &ProxyRequest) -> Vec<(String, Strin
         .collect()
 }
 
+fn filter_upstream_websocket_request_headers(request: &ProxyRequest) -> Vec<(String, String)> {
+    request
+        .headers
+        .iter()
+        .filter(|(name, _)| !is_skipped_upstream_websocket_request_header(name))
+        .cloned()
+        .collect()
+}
+
 fn filter_downstream_response_headers(response: &HttpResponse) -> Vec<(String, String)> {
     let connection_tokens = connection_header_tokens(&response.headers);
     response
         .headers
         .iter()
         .filter(|(name, _)| !is_hop_by_hop_response_header(name, &connection_tokens))
+        .cloned()
+        .collect()
+}
+
+fn filter_downstream_websocket_response_headers(response: &HttpResponse) -> Vec<(String, String)> {
+    response
+        .headers
+        .iter()
+        .filter(|(name, _)| !is_skipped_downstream_websocket_response_header(name))
         .cloned()
         .collect()
 }
@@ -1416,6 +1699,21 @@ fn is_hop_by_hop_request_header(name: &str, connection_tokens: &HashSet<String>)
         )
 }
 
+fn is_skipped_upstream_websocket_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "upgrade"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+    )
+}
+
 fn is_hop_by_hop_response_header(name: &str, connection_tokens: &HashSet<String>) -> bool {
     connection_tokens.contains(name)
         || matches!(
@@ -1429,6 +1727,21 @@ fn is_hop_by_hop_response_header(name: &str, connection_tokens: &HashSet<String>
                 | "trailer"
                 | "upgrade"
         )
+}
+
+fn is_skipped_downstream_websocket_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "upgrade"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+    )
 }
 
 fn add_visible_target_fields(data: &mut Map<String, Value>, request: &ProxyRequest) {
@@ -1647,6 +1960,7 @@ struct MitmResponseResult {
     upstream_status: Option<u16>,
     response_header_bytes: Option<u64>,
     response_body_bytes: Option<u64>,
+    websocket_tunnel_status: Option<&'static str>,
     error: Option<String>,
 }
 
@@ -2245,7 +2559,192 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowlisted_connect_rejects_websocket_upgrade() {
+    async fn allowlisted_connect_forwards_websocket_101_tunnel_and_logs_safely() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+        let client_frame = b"client-frame-secret".to_vec();
+        let upstream_frame = b"upstream-frame-secret".to_vec();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(client_frame.clone(), upstream_frame.clone()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses?api_key=query-secret HTTP/1.1\r\nhost: localhost:{}\r\nauthorization: Bearer websocket-secret\r\ncookie: session=websocket-session-secret\r\nproxy-authorization: Basic proxy-secret\r\nconnection: keep-alive, Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\nsec-websocket-protocol: codex\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let response_head = read_http_response_head(&mut tls).await;
+        assert!(response_head.contains("101 Switching Protocols"));
+        assert!(response_head
+            .to_ascii_lowercase()
+            .contains("upgrade: websocket"));
+        assert!(response_head
+            .to_ascii_lowercase()
+            .contains("connection: upgrade"));
+
+        tls.write_all(&client_frame)
+            .await
+            .expect("write websocket frame bytes");
+        let mut received = vec![0u8; upstream_frame.len()];
+        tls.read_exact(&mut received)
+            .await
+            .expect("read websocket frame bytes");
+        assert_eq!(received, upstream_frame);
+        let _ = tls.shutdown().await;
+
+        let upstream_request = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        assert_eq!(upstream_request.request.method, "GET");
+        assert_eq!(
+            upstream_request.request.target,
+            "/backend-api/codex/responses?api_key=query-secret"
+        );
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "authorization"),
+            Some("Bearer websocket-secret".to_string())
+        );
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "cookie"),
+            Some("session=websocket-session-secret".to_string())
+        );
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "connection"),
+            Some("Upgrade".to_string())
+        );
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "upgrade"),
+            Some("websocket".to_string())
+        );
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "sec-websocket-key"),
+            Some("test-key".to_string())
+        );
+        assert!(header_value(&upstream_request.request.headers, "proxy-authorization").is_none());
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("websocket-secret"));
+        assert!(!log_text.contains("websocket-session-secret"));
+        assert!(!log_text.contains("proxy-secret"));
+        assert!(!log_text.contains("query-secret"));
+        assert!(!log_text.contains("client-frame-secret"));
+        assert!(!log_text.contains("upstream-frame-secret"));
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "websocket_forwarded");
+        assert_eq!(
+            request_event["data"]["path"],
+            "/backend-api/codex/responses?api_key=[redacted]"
+        );
+        assert_eq!(
+            request_event["data"]["auth_shape"]["authorization_present"],
+            true
+        );
+        assert_eq!(request_event["data"]["auth_shape"]["cookie_present"], true);
+
+        let response_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_response")
+            .expect("mitm response event");
+        assert_eq!(response_event["data"]["upstream_status"], 101);
+        assert_eq!(response_event["data"]["status"], "websocket_tunnel_closed");
+        assert_eq!(
+            response_event["data"]["websocket_tunnel_status"],
+            "websocket_tunnel_closed"
+        );
+
+        let proxy_event = records
+            .iter()
+            .find(|record| record["event_type"] == "proxy_request")
+            .expect("proxy request event");
+        assert_eq!(proxy_event["data"]["status"], "websocket_tunnel_closed");
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_passes_through_websocket_non_101_response() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+        let (upstream_addr, upstream_request_rx, upstream_task) = spawn_tls_upstream(
+            b"HTTP/1.1 403 Forbidden\r\ncontent-length: 9\r\nconnection: close\r\n\r\nforbidden"
+                .to_vec(),
+        )
+        .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.ends_with("forbidden"));
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let response_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_response")
+            .expect("mitm response event");
+        assert_eq!(
+            response_event["data"]["status"],
+            "websocket_non_101_response"
+        );
+        assert_eq!(response_event["data"]["upstream_status"], 403);
+        assert_eq!(response_event["data"]["response_body_bytes"], 9);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_websocket_authority_mismatch() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(
+            b"GET /socket HTTP/1.1\r\nhost: example.com\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\n\r\n",
+        )
+        .await
+        .expect("write websocket request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_authority_mismatch"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "authority_mismatch");
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_response"));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_rejects_malformed_websocket_upgrade() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
 
@@ -2260,8 +2759,8 @@ mod tests {
         let mut response = Vec::new();
         tls.read_to_end(&mut response).await.expect("read response");
         let response = String::from_utf8_lossy(&response);
-        assert!(response.contains("501 Not Implemented"));
-        assert!(response.contains("mitm_websocket_unsupported"));
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("mitm_websocket_malformed"));
 
         let log_path = fixture.log_path.clone();
         fixture.shutdown().await;
@@ -2270,7 +2769,11 @@ mod tests {
             .iter()
             .find(|record| record["event_type"] == "mitm_request")
             .expect("mitm request event");
-        assert_eq!(request_event["data"]["status"], "websocket_unsupported");
+        assert_eq!(request_event["data"]["status"], "websocket_malformed");
+        assert_eq!(
+            request_event["data"]["error"],
+            "WebSocket upgrade request is missing Sec-WebSocket-Key"
+        );
     }
 
     #[tokio::test]
@@ -2418,6 +2921,56 @@ mod tests {
         (addr, request_rx, task)
     }
 
+    async fn spawn_tls_websocket_upstream_101(
+        expected_client_bytes: Vec<u8>,
+        upstream_bytes: Vec<u8>,
+    ) -> (
+        SocketAddr,
+        oneshot::Receiver<CapturedUpstreamRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server_config, root_cert) = test_upstream_server_config();
+        trust_test_upstream_root(root_cert);
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let addr = listener.local_addr().expect("upstream local addr");
+        let (request_tx, request_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("upstream accept");
+            let mut tls = acceptor.accept(stream).await.expect("upstream tls accept");
+            let mut reader = BufReader::new(&mut tls);
+            let request = read_proxy_request(&mut reader)
+                .await
+                .expect("read upstream request");
+            let _ = request_tx.send(CapturedUpstreamRequest {
+                request,
+                body: Vec::new(),
+            });
+            reader
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: accept-token\r\n\r\n",
+                )
+                .await
+                .expect("write websocket response");
+            let mut received = vec![0u8; expected_client_bytes.len()];
+            reader
+                .read_exact(&mut received)
+                .await
+                .expect("read websocket client bytes");
+            assert_eq!(received, expected_client_bytes);
+            reader
+                .get_mut()
+                .write_all(&upstream_bytes)
+                .await
+                .expect("write websocket upstream bytes");
+            let _ = reader.get_mut().shutdown().await;
+        });
+        (addr, request_rx, task)
+    }
+
     async fn spawn_tls_upstream_hanging_response(
         response_head: Vec<u8>,
     ) -> (SocketAddr, JoinHandle<()>) {
@@ -2547,6 +3100,22 @@ mod tests {
         }
         let connect_response = String::from_utf8_lossy(&connect_response);
         assert!(connect_response.contains("200 Connection Established"));
+    }
+
+    async fn read_http_response_head<R>(stream: &mut R) -> String
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read response head");
+            response.push(byte[0]);
+        }
+        String::from_utf8_lossy(&response).to_string()
     }
 
     #[test]

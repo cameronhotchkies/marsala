@@ -1,6 +1,6 @@
 # Codex Acquisition Probe
 
-This note validates Marsala as an explicit Codex Responses gateway and metadata-only proxy probe. It validates `/v1/responses` forwarding through the configured custom-provider/base-URL path, including HTTP streaming passthrough when Codex sends `stream=true`. It also records the inbound-auth passthrough result for public `api.openai.com`: transport succeeds, but upstream returns `401 Unauthorized`. It does not validate WebSocket forwarding or TLS interception.
+This note validates Marsala as an explicit Codex Responses gateway and metadata-only proxy probe. It validates `/v1/responses` forwarding through the configured custom-provider/base-URL path, including HTTP streaming passthrough when Codex sends `stream=true`. It also records the inbound-auth passthrough result for public `api.openai.com`: transport succeeds, but upstream returns `401 Unauthorized`. WebSocket forwarding is supported only on the exact allowlisted MITM HTTP/1.1 `Upgrade: websocket` steel thread described in `mitm-steel-thread.md`; HTTP/2 MITM forwarding remains unsupported.
 
 ## Start Marsala
 
@@ -179,11 +179,11 @@ Expected: direct `responses_request`; no `proxy_request`.
 
 ## Current Gaps
 
-- `/v1/responses` WebSocket upgrade/proxying is not implemented; use a custom provider with `model_providers.marsala_responses.supports_websockets=false`.
+- `/v1/responses` WebSocket upgrade/proxying is not implemented on the explicit gateway/custom-provider path; use a custom provider with `model_providers.marsala_responses.supports_websockets=false`.
 - `/v1/chat/completions` streaming passthrough is not implemented; `stream=true` returns local `400 unsupported_streaming`.
 - Plain HTTP proxy forwarding is not implemented; it logs metadata and returns local `501`.
 - Non-allowlisted HTTPS `CONNECT` is tunneled without MITM, decryption, request body capture, or response body capture.
-- Exact allowlisted HTTPS `CONNECT` can be MITM-forwarded for HTTP/1.1 with sanitized metadata; HTTP/2, WebSocket upgrades, and request transfer-encoding streaming remain unsupported.
+- Exact allowlisted HTTPS `CONNECT` can be MITM-forwarded for HTTP/1.1 with sanitized metadata, including HTTP/1.1 WebSocket `101 Switching Protocols` tunnels to the same CONNECT host:port; HTTP/2 and request transfer-encoding streaming remain unsupported.
 - Inbound-auth passthrough to public `api.openai.com` is not the subscription-backed normal Codex success path as currently observed; allowlisted MITM is the main path for discovering the real upstream shape.
 
 See [mitm-steel-thread.md](mitm-steel-thread.md) for allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY` and `CODEX_CA_CERTIFICATE`.
