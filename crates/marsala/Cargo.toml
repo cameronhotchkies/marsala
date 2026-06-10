@@ -13,6 +13,7 @@ clap.workspace = true
 config.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
 reqwest.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true

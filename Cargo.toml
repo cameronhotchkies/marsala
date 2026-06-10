@@ -16,6 +16,7 @@ clap = { version = "=4.5.57", features = ["derive", "env"] }
 config = { version = "=0.15.11", default-features = false, features = ["toml"] }
 futures-core = "0.3"
 futures-util = "0.3"
+flate2 = "1.0"
 reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls", "stream"] }
 rcgen = { version = "=0.14.8", features = ["x509-parser"] }
 rustls-pemfile = "=2.2.0"

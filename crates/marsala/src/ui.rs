@@ -392,7 +392,7 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       const meta = document.getElementById('detailMeta');
       meta.innerHTML = '';
       if (event) {
-        for (const value of [event.category, event.target_host, event.method, event.direction, statusText(event), event.byte_summary, event.auth_summary, event.truncated ? 'truncated' : '']) {
+        for (const value of [event.category, event.target_host, event.method, event.direction, statusText(event), event.byte_summary, event.auth_summary, event.preview_status, event.truncated ? 'truncated' : '']) {
           if (!value) continue;
           const span = document.createElement('span');
           span.className = 'pill';
@@ -405,6 +405,9 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       if (event && event.preview) {
         previewSection.hidden = false;
         preview.textContent = event.preview;
+      } else if (event && previewUnavailableText(event)) {
+        previewSection.hidden = false;
+        preview.textContent = previewUnavailableText(event);
       } else {
         previewSection.hidden = true;
         preview.textContent = '';
@@ -430,6 +433,16 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       const status = Number(event.upstream_status || event.status);
       if (status >= 500) return 'bad';
       if (status >= 400 || event.truncated) return 'warn';
+      return '';
+    }
+
+    function previewUnavailableText(event) {
+      const data = event.raw && event.raw.data ? event.raw.data : {};
+      if (event.preview_status === 'binary_skipped') return 'binary payload skipped';
+      if (event.preview_status === 'compressed_preview_unavailable') return data.preview_error || 'compressed preview unavailable';
+      if (event.preview_status === 'compressed_fragmented_preview_unavailable') return 'compressed fragmented preview unavailable';
+      if (event.preview_status === 'decoded_non_utf8') return 'decoded payload is not UTF-8';
+      if (data.utf8 === false) return data.compressed ? 'compressed preview unavailable' : 'text preview unavailable: not UTF-8';
       return '';
     }
 
@@ -496,6 +509,7 @@ pub(crate) struct UiEvent {
     pub auth_summary: Option<String>,
     pub truncated: bool,
     pub preview: Option<String>,
+    pub preview_status: Option<String>,
     pub summary: String,
     pub raw: Value,
 }
@@ -584,6 +598,7 @@ pub(crate) fn ui_event_from_record(record: EventRecord) -> UiEvent {
     let auth_summary = auth_summary(data);
     let truncated = bool_field(data, "truncated").unwrap_or(false);
     let preview = string_field(data, "preview");
+    let preview_status = string_field(data, "preview_status");
     let category = category_for(&record.event_type).to_string();
     let summary = summary_text(
         &record.event_type,
@@ -616,6 +631,7 @@ pub(crate) fn ui_event_from_record(record: EventRecord) -> UiEvent {
         auth_summary,
         truncated,
         preview,
+        preview_status,
         summary,
         raw,
     }
@@ -842,6 +858,58 @@ mod tests {
         assert_eq!(event.byte_summary.as_deref(), Some("body=128B preview=64B"));
         assert!(event.truncated);
         assert!(event.summary.contains("truncated"));
+    }
+
+    #[test]
+    fn transforms_websocket_preview_status_for_ui() {
+        let event = ui_event_from_record(record(
+            "mitm_websocket_frame",
+            json!({
+                "target_host": "chatgpt.com",
+                "method": "GET",
+                "path": "/backend-api/codex/responses",
+                "direction": "request",
+                "opcode": "text",
+                "payload_bytes": 64,
+                "preview_bytes": 32,
+                "utf8": true,
+                "compressed": true,
+                "decoded": true,
+                "preview_status": "decoded",
+                "preview": "{\"input\":\"hello\"}"
+            }),
+        ));
+
+        assert_eq!(event.category, "payload");
+        assert_eq!(event.preview_status.as_deref(), Some("decoded"));
+        assert_eq!(event.preview.as_deref(), Some("{\"input\":\"hello\"}"));
+
+        let unavailable = ui_event_from_record(record(
+            "mitm_websocket_frame",
+            json!({
+                "target_host": "chatgpt.com",
+                "method": "GET",
+                "path": "/backend-api/codex/responses",
+                "direction": "request",
+                "opcode": "text",
+                "payload_bytes": 64,
+                "utf8": false,
+                "compressed": true,
+                "decoded": false,
+                "preview_status": "compressed_preview_unavailable",
+                "preview_error": "deflate_decode_failed: corrupt deflate stream"
+            }),
+        ));
+
+        assert_eq!(
+            unavailable.preview_status.as_deref(),
+            Some("compressed_preview_unavailable")
+        );
+        assert!(unavailable.preview.is_none());
+        assert_eq!(
+            unavailable.raw["data"]["preview_error"],
+            "deflate_decode_failed: corrupt deflate stream"
+        );
     }
 
     #[test]

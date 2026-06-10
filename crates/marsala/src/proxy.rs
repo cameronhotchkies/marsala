@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use flate2::{Decompress, FlushDecompress};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -834,6 +835,10 @@ struct MitmWebSocketFrameEvent<'a> {
     payload_bytes: u64,
     preview: Option<CapturedTextPreview>,
     skipped_payload: bool,
+    compressed: bool,
+    decoded: bool,
+    preview_status: &'static str,
+    preview_error: Option<String>,
 }
 
 fn emit_mitm_websocket_frame_event(event_log: &EventLogHandle, event: MitmWebSocketFrameEvent<'_>) {
@@ -853,6 +858,12 @@ fn emit_mitm_websocket_frame_event(event_log: &EventLogHandle, event: MitmWebSoc
     data.insert("opcode".into(), event.opcode.as_str().into());
     data.insert("payload_bytes".into(), event.payload_bytes.into());
     data.insert("skipped_payload".into(), event.skipped_payload.into());
+    data.insert("compressed".into(), event.compressed.into());
+    data.insert("decoded".into(), event.decoded.into());
+    data.insert("preview_status".into(), event.preview_status.into());
+    if let Some(preview_error) = event.preview_error {
+        data.insert("preview_error".into(), preview_error.into());
+    }
     if let Some(preview) = event.preview {
         data.insert("preview_bytes".into(), preview.preview_bytes.into());
         data.insert("truncated".into(), preview.truncated.into());
@@ -1325,6 +1336,7 @@ where
         .await
         .context("failed to forward buffered WebSocket upstream bytes downstream")?;
 
+    let compression = WebSocketCompression::from_handshake(request, &response);
     let tunnel_result = if logging.capture_mitm_websocket_frames {
         copy_bidirectional_with_websocket_capture(
             downstream.get_mut(),
@@ -1336,6 +1348,7 @@ where
                 target_port: port,
                 request,
                 preview_cap: logging.mitm_websocket_frame_preview_bytes,
+                compression,
             },
         )
         .await
@@ -1696,6 +1709,82 @@ struct WebSocketCaptureContext<'a> {
     target_port: u16,
     request: &'a ProxyRequest,
     preview_cap: usize,
+    compression: WebSocketCompression,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WebSocketCompression {
+    permessage_deflate: bool,
+    client_no_context_takeover: bool,
+    server_no_context_takeover: bool,
+}
+
+impl WebSocketCompression {
+    fn from_handshake(request: &ProxyRequest, response: &HttpResponse) -> Self {
+        let request_offered = websocket_extensions(&request.headers)
+            .iter()
+            .any(|extension| extension.name.eq_ignore_ascii_case("permessage-deflate"));
+        let Some(accepted) = websocket_extensions(&response.headers)
+            .into_iter()
+            .find(|extension| extension.name.eq_ignore_ascii_case("permessage-deflate"))
+        else {
+            return Self::default();
+        };
+
+        if !request_offered {
+            return Self::default();
+        }
+
+        Self {
+            permessage_deflate: true,
+            client_no_context_takeover: accepted.has_param("client_no_context_takeover"),
+            server_no_context_takeover: accepted.has_param("server_no_context_takeover"),
+        }
+    }
+
+    fn direction_no_context_takeover(self, direction: PayloadDirection) -> bool {
+        match direction {
+            PayloadDirection::Request => self.client_no_context_takeover,
+            PayloadDirection::Response => self.server_no_context_takeover,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WebSocketExtension {
+    name: String,
+    params: Vec<String>,
+}
+
+impl WebSocketExtension {
+    fn has_param(&self, name: &str) -> bool {
+        self.params
+            .iter()
+            .any(|param| param.eq_ignore_ascii_case(name))
+    }
+}
+
+fn websocket_extensions(headers: &[(String, String)]) -> Vec<WebSocketExtension> {
+    headers
+        .iter()
+        .filter(|(name, _)| name == "sec-websocket-extensions")
+        .flat_map(|(_, value)| value.split(','))
+        .filter_map(|extension| {
+            let mut parts = extension.split(';').map(str::trim);
+            let name = parts.next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let params = parts
+                .filter_map(|part| {
+                    let name = part.split_once('=').map(|(name, _)| name).unwrap_or(part);
+                    let name = name.trim();
+                    (!name.is_empty()).then(|| name.to_string())
+                })
+                .collect();
+            Some(WebSocketExtension { name, params })
+        })
+        .collect()
 }
 
 async fn copy_bidirectional_with_websocket_capture<A, B>(
@@ -1707,8 +1796,10 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut downstream_to_upstream = WebSocketFrameInspector::new(PayloadDirection::Request);
-    let mut upstream_to_downstream = WebSocketFrameInspector::new(PayloadDirection::Response);
+    let mut downstream_to_upstream =
+        WebSocketFrameInspector::new(PayloadDirection::Request, context.compression);
+    let mut upstream_to_downstream =
+        WebSocketFrameInspector::new(PayloadDirection::Response, context.compression);
     let mut downstream_buf = [0u8; 8192];
     let mut upstream_buf = [0u8; 8192];
     let mut client_to_server_bytes = 0u64;
@@ -1786,13 +1877,17 @@ impl WebSocketOpcode {
 struct WebSocketFrameInspector {
     direction: PayloadDirection,
     buffer: Vec<u8>,
+    compression: WebSocketCompression,
+    decompressor: Option<Decompress>,
 }
 
 impl WebSocketFrameInspector {
-    fn new(direction: PayloadDirection) -> Self {
+    fn new(direction: PayloadDirection, compression: WebSocketCompression) -> Self {
         Self {
             direction,
             buffer: Vec::new(),
+            compression,
+            decompressor: None,
         }
     }
 
@@ -1812,7 +1907,10 @@ impl WebSocketFrameInspector {
             return None;
         }
 
-        let opcode = WebSocketOpcode::from_byte(self.buffer[0] & 0x0f);
+        let first_byte = self.buffer[0];
+        let fin = first_byte & 0x80 != 0;
+        let rsv1 = first_byte & 0x40 != 0;
+        let opcode = WebSocketOpcode::from_byte(first_byte & 0x0f);
         let masked = self.buffer[1] & 0x80 != 0;
         let mut offset = 2usize;
         let mut payload_len = (self.buffer[1] & 0x7f) as usize;
@@ -1870,12 +1968,18 @@ impl WebSocketFrameInspector {
         }
         self.buffer.drain(..frame_len);
 
-        Some(WebSocketFrame { opcode, payload })
+        Some(WebSocketFrame {
+            fin,
+            rsv1,
+            opcode,
+            payload,
+        })
     }
 
-    fn emit_frame(&self, frame: WebSocketFrame, context: &WebSocketCaptureContext<'_>) {
+    fn emit_frame(&mut self, frame: WebSocketFrame, context: &WebSocketCaptureContext<'_>) {
         match frame.opcode {
             WebSocketOpcode::Text => {
+                let preview = self.text_preview(&frame, context.preview_cap);
                 emit_mitm_websocket_frame_event(
                     context.event_log,
                     MitmWebSocketFrameEvent {
@@ -1886,12 +1990,12 @@ impl WebSocketFrameInspector {
                         direction: self.direction,
                         opcode: frame.opcode,
                         payload_bytes: frame.payload.len() as u64,
-                        preview: Some(captured_text_preview(
-                            &frame.payload[..frame.payload.len().min(context.preview_cap)],
-                            frame.payload.len() as u64,
-                            context.preview_cap,
-                        )),
+                        preview: preview.preview,
                         skipped_payload: false,
+                        compressed: preview.compressed,
+                        decoded: preview.decoded,
+                        preview_status: preview.status,
+                        preview_error: preview.error,
                     },
                 );
             }
@@ -1908,17 +2012,132 @@ impl WebSocketFrameInspector {
                         payload_bytes: frame.payload.len() as u64,
                         preview: None,
                         skipped_payload: true,
+                        compressed: false,
+                        decoded: false,
+                        preview_status: "binary_skipped",
+                        preview_error: None,
                     },
                 );
             }
             _ => {}
         }
     }
+
+    fn text_preview(&mut self, frame: &WebSocketFrame, preview_cap: usize) -> WebSocketTextPreview {
+        let compressed = self.compression.permessage_deflate && frame.rsv1;
+        if !compressed {
+            let preview = captured_text_preview(
+                &frame.payload[..frame.payload.len().min(preview_cap)],
+                frame.payload.len() as u64,
+                preview_cap,
+            );
+            let status = if preview.utf8 {
+                "available"
+            } else {
+                "text_preview_unavailable"
+            };
+            return WebSocketTextPreview {
+                preview: Some(preview),
+                compressed: false,
+                decoded: false,
+                status,
+                error: None,
+            };
+        }
+
+        if !frame.fin {
+            return WebSocketTextPreview {
+                preview: None,
+                compressed: true,
+                decoded: false,
+                status: "compressed_fragmented_preview_unavailable",
+                error: None,
+            };
+        }
+
+        match self.decode_permessage_deflate(&frame.payload) {
+            Ok(decoded) => {
+                let preview = captured_text_preview(
+                    &decoded[..decoded.len().min(preview_cap)],
+                    decoded.len() as u64,
+                    preview_cap,
+                );
+                if preview.utf8 {
+                    WebSocketTextPreview {
+                        preview: Some(preview),
+                        compressed: true,
+                        decoded: true,
+                        status: "decoded",
+                        error: None,
+                    }
+                } else {
+                    WebSocketTextPreview {
+                        preview: Some(preview),
+                        compressed: true,
+                        decoded: true,
+                        status: "decoded_non_utf8",
+                        error: None,
+                    }
+                }
+            }
+            Err(error) => WebSocketTextPreview {
+                preview: Some(captured_text_preview(
+                    &frame.payload[..frame.payload.len().min(preview_cap)],
+                    frame.payload.len() as u64,
+                    preview_cap,
+                )),
+                compressed: true,
+                decoded: false,
+                status: "compressed_preview_unavailable",
+                error: Some(error),
+            },
+        }
+    }
+
+    fn decode_permessage_deflate(
+        &mut self,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, String> {
+        let no_context_takeover = self
+            .compression
+            .direction_no_context_takeover(self.direction);
+        if no_context_takeover || self.decompressor.is_none() {
+            self.decompressor = Some(Decompress::new(false));
+        }
+
+        // permessage-deflate uses raw DEFLATE blocks with the sync-flush trailer omitted;
+        // flate2 gives us that standard decoder locally without changing tunneled bytes.
+        let decompressor = self
+            .decompressor
+            .as_mut()
+            .expect("websocket decompressor initialized");
+        let mut compressed = Vec::with_capacity(payload.len() + 4);
+        compressed.extend_from_slice(payload);
+        compressed.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+        let mut decoded = Vec::with_capacity(payload.len().saturating_mul(2).max(1024));
+        decompressor
+            .decompress_vec(&compressed, &mut decoded, FlushDecompress::Sync)
+            .map_err(|error| format!("deflate_decode_failed: {error}"))?;
+        if no_context_takeover {
+            self.decompressor = None;
+        }
+        Ok(decoded)
+    }
 }
 
 struct WebSocketFrame {
+    fin: bool,
+    rsv1: bool,
     opcode: WebSocketOpcode,
     payload: Vec<u8>,
+}
+
+struct WebSocketTextPreview {
+    preview: Option<CapturedTextPreview>,
+    compressed: bool,
+    decoded: bool,
+    status: &'static str,
+    error: Option<String>,
 }
 
 fn mitm_tls_acceptor(config: &MitmConfig, host: &str) -> Result<TlsAcceptor> {
@@ -3575,6 +3794,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mitm_websocket_capture_decodes_permessage_deflate_text_preview_without_rewriting_frame(
+    ) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut logging = LoggingConfig::default();
+        logging.capture_mitm_websocket_frames = true;
+        logging.mitm_websocket_frame_preview_bytes = 128;
+        let fixture = spawn_allowlisted_mitm_proxy_with_logging(&tempdir, logging).await;
+        let client_text = websocket_client_compressed_text_frame(
+            "api_key=compressed-client-secret&message=hello-compressed-websocket",
+        );
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101_with_response_headers(
+                client_text.clone(),
+                Vec::new(),
+                "sec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n",
+            )
+            .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\nsec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let response_head = read_http_response_head(&mut tls).await;
+        assert!(response_head.contains("101 Switching Protocols"));
+
+        tls.write_all(&client_text)
+            .await
+            .expect("write compressed websocket frame");
+        let _ = tls.shutdown().await;
+
+        let upstream_request = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        assert_eq!(
+            header_value(
+                &upstream_request.request.headers,
+                "sec-websocket-extensions"
+            ),
+            Some(
+                "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+                    .to_string()
+            )
+        );
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("compressed-client-secret"));
+
+        let records = read_json_records(&log_path);
+        let request_text = records
+            .iter()
+            .find(|record| {
+                record["event_type"] == "mitm_websocket_frame"
+                    && record["data"]["direction"] == "request"
+                    && record["data"]["opcode"] == "text"
+            })
+            .expect("request text frame");
+        assert_eq!(request_text["data"]["compressed"], true);
+        assert_eq!(request_text["data"]["decoded"], true);
+        assert_eq!(request_text["data"]["utf8"], true);
+        assert_eq!(request_text["data"]["preview_status"], "decoded");
+        assert!(request_text["data"]["preview"]
+            .as_str()
+            .expect("decoded request text preview")
+            .contains("api_key=[redacted]"));
+        assert!(request_text["data"]["preview"]
+            .as_str()
+            .expect("decoded request text preview")
+            .contains("hello-compressed-websocket"));
+    }
+
+    #[tokio::test]
     async fn allowlisted_connect_passes_through_websocket_non_101_response() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
@@ -3843,6 +4140,23 @@ mod tests {
         oneshot::Receiver<CapturedUpstreamRequest>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_tls_websocket_upstream_101_with_response_headers(
+            expected_client_bytes,
+            upstream_bytes,
+            "",
+        )
+        .await
+    }
+
+    async fn spawn_tls_websocket_upstream_101_with_response_headers(
+        expected_client_bytes: Vec<u8>,
+        upstream_bytes: Vec<u8>,
+        response_headers: &'static str,
+    ) -> (
+        SocketAddr,
+        oneshot::Receiver<CapturedUpstreamRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (server_config, root_cert) = test_upstream_server_config();
         trust_test_upstream_root(root_cert);
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
@@ -3862,11 +4176,12 @@ mod tests {
                 request,
                 body: Vec::new(),
             });
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: accept-token\r\n{response_headers}\r\n"
+            );
             reader
                 .get_mut()
-                .write_all(
-                    b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: accept-token\r\n\r\n",
-                )
+                .write_all(response.as_bytes())
                 .await
                 .expect("write websocket response");
             let mut received = vec![0u8; expected_client_bytes.len()];
@@ -4036,6 +4351,14 @@ mod tests {
         websocket_frame(0x1, payload.as_bytes(), Some([0x11, 0x22, 0x33, 0x44]))
     }
 
+    fn websocket_client_compressed_text_frame(payload: &str) -> Vec<u8> {
+        websocket_frame_with_rsv1(
+            0x1,
+            &permessage_deflate_payload(payload.as_bytes()),
+            Some([0x21, 0x32, 0x43, 0x54]),
+        )
+    }
+
     fn websocket_client_binary_frame(payload: &[u8]) -> Vec<u8> {
         websocket_frame(0x2, payload, Some([0x55, 0x66, 0x77, 0x88]))
     }
@@ -4049,9 +4372,23 @@ mod tests {
     }
 
     fn websocket_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+        websocket_frame_with_flags(opcode, false, payload, mask)
+    }
+
+    fn websocket_frame_with_rsv1(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+        websocket_frame_with_flags(opcode, true, payload, mask)
+    }
+
+    fn websocket_frame_with_flags(
+        opcode: u8,
+        rsv1: bool,
+        payload: &[u8],
+        mask: Option<[u8; 4]>,
+    ) -> Vec<u8> {
         assert!(payload.len() < 126, "test helper supports small frames");
         let mut frame = Vec::with_capacity(2 + mask.map(|_| 4).unwrap_or(0) + payload.len());
-        frame.push(0x80 | opcode);
+        let rsv1_bit = if rsv1 { 0x40 } else { 0x00 };
+        frame.push(0x80 | rsv1_bit | opcode);
         frame.push(payload.len() as u8 | mask.map(|_| 0x80).unwrap_or(0));
         if let Some(mask) = mask {
             frame.extend_from_slice(&mask);
@@ -4062,6 +4399,18 @@ mod tests {
             frame.extend_from_slice(payload);
         }
         frame
+    }
+
+    fn permessage_deflate_payload(payload: &[u8]) -> Vec<u8> {
+        let mut compressor = flate2::Compress::new(flate2::Compression::fast(), false);
+        let mut compressed = Vec::with_capacity(payload.len() + 16);
+        compressor
+            .compress_vec(payload, &mut compressed, flate2::FlushCompress::Sync)
+            .expect("compress websocket payload");
+        if compressed.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            compressed.truncate(compressed.len() - 4);
+        }
+        compressed
     }
 
     #[test]
