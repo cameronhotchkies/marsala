@@ -1,6 +1,6 @@
 # MITM Steel Thread Validation
 
-Status: first TLS termination proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, log sanitized `mitm_tls` handshake metadata, read the first decrypted HTTP/1.1 request headers when available, and emit sanitized `mitm_request` metadata. Upstream forwarding is not implemented yet.
+Status: HTTP/1.1 forwarding proof. Marsala can generate a local CA, validate exact-host MITM config, terminate TLS for allowlisted `CONNECT` targets, forward decrypted HTTP/1.1 requests upstream over verified TLS to the same host:port, stream upstream responses back downstream, and emit sanitized `mitm_tls`, `mitm_request`, and `mitm_response` metadata.
 
 Observed facts:
 
@@ -60,7 +60,7 @@ Expected today: config prints successfully.
 
 Use `api.openai.com` as an optional allowlist host only when validating the API/custom-provider path.
 
-## TLS Termination Proof
+## TLS Termination And HTTP/1.1 Forwarding Proof
 
 Start Marsala with the proxy and MITM config accepted:
 
@@ -90,8 +90,10 @@ Expected today:
 - `proxy_request` entries with `method=CONNECT`, `target_host=chatgpt.com` or `target_host=ab.chatgpt.com`, and `target_port=443`.
 - For allowlisted ChatGPT hosts, `connect_action=mitm`.
 - `mitm_tls` with the same exact host and `status=handshake_ok`, or `status=error` if the client does not trust the generated CA.
-- `mitm_request` with sanitized `method`, redacted `path`, and `auth_shape` for the first decrypted HTTP/1.1 request if the client sends one.
-- The client receives local `501 mitm_http_forwarding_unimplemented` because upstream forwarding is not implemented in this proof.
+- `mitm_request` with sanitized `method`, redacted `path`, `auth_shape`, and bounded request byte counts for decrypted HTTP/1.1 requests.
+- `mitm_response` with upstream status and response byte counts when forwarding reaches the upstream server.
+- The client receives the upstream HTTP/1.1 response when the request has no body or a `Content-Length` body up to 1 MiB.
+- HTTP/2, WebSocket upgrades, and request `Transfer-Encoding` streaming are logged as explicit unsupported MITM statuses.
 - Non-allowlisted HTTPS targets, including observed `github.com` traffic, still tunnel and do not produce `mitm_tls` or `mitm_request`.
 
 ## CA Fallback
@@ -110,15 +112,15 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
 
 ## Remaining Full-MITM Gap
 
-The current proof terminates downstream TLS and observes the first HTTP/1.1 request headers, then returns local `501 mitm_http_forwarding_unimplemented`.
+The current proof terminates downstream TLS and forwards HTTP/1.1 requests/responses without logging bodies or chunks.
 
 Still missing:
 
-- upstream TLS connection and request forwarding
-- HTTP response forwarding
-- request/response body policy and streaming support
-- explicit HTTP/2 handling beyond safe unsupported logging
+- HTTP/2 forwarding
+- WebSocket forwarding
+- request body streaming for chunked or otherwise unbounded bodies
+- validation that a normal ChatGPT-backed Codex run stays on HTTP/1.1 and succeeds through the terminated TLS path
 
 Safety invariant: `logs/events.jsonl` must contain no raw bearer token, cookie, request body, response body, or stream chunk content.
 
-Do not claim full Codex MITM until upstream forwarding is implemented and a normal Codex run succeeds through the terminated TLS path.
+Do not claim full Codex MITM until a normal Codex run succeeds through the terminated TLS path.

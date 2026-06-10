@@ -2,7 +2,7 @@
 
 Marsala currently ships a local-first Rust service skeleton with non-streaming OpenAI-shaped chat completions and Responses forwarding, plus streaming passthrough for `POST /v1/responses` with `stream=true`. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, `POST /v1/chat/completions`, and `POST /v1/responses`, writes JSONL events, and shuts down on `Ctrl-C`.
 
-That explicit gateway remains supported as a compatibility path for Codex custom providers. The proxy/MITM path is the mainline for normal ChatGPT-backed Codex: non-allowlisted HTTPS is tunneled with metadata logging, and exact allowlisted hosts can be TLS-terminated to log sanitized handshake and first HTTP/1.1 request metadata. Marsala still does not implement request/response body capture, stream chunk capture, upstream MITM forwarding, HTTP/2 MITM, or WebSocket MITM.
+That explicit gateway remains supported as a compatibility path for Codex custom providers. The proxy/MITM path is the mainline for normal ChatGPT-backed Codex: non-allowlisted HTTPS is tunneled with metadata logging, and exact allowlisted hosts can be TLS-terminated so HTTP/1.1 requests are forwarded upstream over verified TLS with sanitized `mitm_request` and `mitm_response` metadata. Marsala still does not implement request/response body capture, stream chunk capture, HTTP/2 MITM forwarding, WebSocket MITM forwarding, or unbounded request-body streaming.
 
 ## Prerequisites
 
@@ -138,7 +138,8 @@ MITM foundation settings:
 - `mitm.default_action="tunnel"` is the only supported default action in this foundation
 - `mitm.allow_hosts` must contain exact hostnames only, such as `chatgpt.com`, `ab.chatgpt.com`, or API-path `api.openai.com`; URLs, ports, and wildcards are rejected
 - `mitm.ca_cert_path` and `mitm.ca_key_path` define where `marsala mitm ca init` writes the local CA certificate and private key
-- `mitm.enabled=true` terminates TLS only for exact allowlisted `CONNECT` hosts, generates a per-host leaf certificate from the configured CA, logs sanitized `mitm_tls` metadata, reads the first decrypted HTTP/1.1 request headers when available, logs sanitized `mitm_request` metadata, and returns local `501 mitm_http_forwarding_unimplemented`
+- `mitm.enabled=true` terminates TLS only for exact allowlisted `CONNECT` hosts, generates a per-host leaf certificate from the configured CA, logs sanitized `mitm_tls` metadata, forwards decrypted HTTP/1.1 requests upstream over verified TLS, streams upstream responses back downstream, and emits sanitized `mitm_request` and `mitm_response` metadata
+- Current MITM forwarding supports no-body requests and bounded `Content-Length` request bodies up to 1 MiB; request `Transfer-Encoding` streaming, HTTP/2, and WebSocket upgrades are explicitly rejected/logged as unsupported
 - MITM is now the main path for discovering the real subscription-backed normal Codex upstream shape, because inbound-auth passthrough to public `api.openai.com` has been observed to return `401 Unauthorized`
 - Normal subscription-backed Codex has been observed connecting to `chatgpt.com:443` and `ab.chatgpt.com:443`; do not add unrelated hosts such as `github.com` to the MITM allowlist
 
@@ -173,7 +174,7 @@ env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
     'Reply with one short sentence.'
 ```
 
-Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, and emits `mitm_request` with sanitized method/path/auth-shape metadata for the first decrypted HTTP/1.1 request when the client sends one. Marsala then returns local `501 mitm_http_forwarding_unimplemented`; upstream forwarding, request body capture, response body capture, and stream forwarding are still not implemented.
+Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, forwards decrypted HTTP/1.1 requests to the same host:port over verified upstream TLS, returns the upstream response, and emits sanitized `mitm_request` and `mitm_response` metadata. If Codex uses HTTP/2, WebSocket upgrades, or request-body streaming beyond bounded `Content-Length`, Marsala logs an explicit unsupported status instead of silently forwarding it.
 
 See [docs/validation/codex-acquisition-probe.md](docs/validation/codex-acquisition-probe.md) for exact Codex validation commands.
 See [docs/planning/05_mitm_foundation.md](docs/planning/05_mitm_foundation.md) for the planned allowlisted MITM steel thread and Rust stack.

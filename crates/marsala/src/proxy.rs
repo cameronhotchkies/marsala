@@ -1,4 +1,7 @@
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::{
+    collections::HashSet,
     fs,
     net::SocketAddr,
     sync::{Arc, Once},
@@ -12,17 +15,20 @@ use rcgen::{
 };
 use serde_json::{Map, Value};
 use tokio::{
-    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{
+        self, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
     net::{TcpListener, TcpStream},
     sync::watch,
     time::{timeout, Duration},
 };
 use tokio_rustls::{
     rustls::{
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-        ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName},
+        ClientConfig, RootCertStore, ServerConfig,
     },
-    TlsAcceptor,
+    TlsAcceptor, TlsConnector,
 };
 use tracing::{debug, info};
 
@@ -32,6 +38,7 @@ use crate::{
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_MITM_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve(
@@ -354,29 +361,102 @@ async fn handle_mitm_connect(
     );
 
     let mut tls_reader = BufReader::new(&mut tls_stream);
-    let (status, error) =
+    let (status, error) = if alpn.as_deref() == Some("h2") {
+        let message = "MITM HTTP/2 forwarding is not implemented".to_string();
+        emit_mitm_request_event(
+            &event_log,
+            MitmRequestEvent {
+                started,
+                target_host: &host,
+                target_port: port,
+                request: None,
+                status: "http2_unsupported",
+                alpn: alpn.as_deref(),
+                request_body_bytes: None,
+                error: Some(message.clone()),
+            },
+        );
+        let _ = tls_reader.get_mut().shutdown().await;
+        ("http2_unsupported", Some(message))
+    } else {
         match timeout(HEADER_READ_TIMEOUT, read_proxy_request(&mut tls_reader)).await {
             Ok(Ok(http_request)) => {
-                let request_status = if is_http2_request(&http_request, alpn.as_deref()) {
-                    "http2_unsupported"
-                } else {
-                    "mitm_http_forwarding_unimplemented"
-                };
-                emit_mitm_request_event(
-                    &event_log,
-                    MitmRequestEvent {
-                        started,
-                        target_host: &host,
-                        target_port: port,
-                        request: Some(&http_request),
-                        status: request_status,
-                        alpn: alpn.as_deref(),
-                        error: None,
-                    },
-                );
-                write_mitm_http_unimplemented_response(tls_reader.get_mut()).await?;
-                let _ = tls_reader.get_mut().shutdown().await;
-                (request_status, None)
+                match forward_mitm_http1_request(&mut tls_reader, &host, port, &http_request).await
+                {
+                    Ok(result) => {
+                        emit_mitm_request_event(
+                            &event_log,
+                            MitmRequestEvent {
+                                started,
+                                target_host: &host,
+                                target_port: port,
+                                request: Some(&http_request),
+                                status: result.request_status,
+                                alpn: alpn.as_deref(),
+                                request_body_bytes: Some(result.request_body_bytes),
+                                error: result.request_error.clone(),
+                            },
+                        );
+                        if let Some(response) = &result.response {
+                            emit_mitm_response_event(
+                                &event_log,
+                                MitmResponseEvent {
+                                    started,
+                                    target_host: &host,
+                                    target_port: port,
+                                    request: &http_request,
+                                    status: response.status,
+                                    upstream_status: response.upstream_status,
+                                    response_header_bytes: response.response_header_bytes,
+                                    response_body_bytes: response.response_body_bytes,
+                                    error: response.error.clone(),
+                                },
+                            );
+                        }
+                        let _ = tls_reader.get_mut().shutdown().await;
+                        (result.proxy_status, result.proxy_error)
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = write_mitm_http_error_response(
+                            tls_reader.get_mut(),
+                            502,
+                            "Bad Gateway",
+                            "mitm_upstream_error",
+                            "Marsala could not complete upstream MITM forwarding",
+                        )
+                        .await;
+                        emit_mitm_request_event(
+                            &event_log,
+                            MitmRequestEvent {
+                                started,
+                                target_host: &host,
+                                target_port: port,
+                                request: Some(&http_request),
+                                status: "error",
+                                alpn: alpn.as_deref(),
+                                request_body_bytes: None,
+                                error: Some(message.clone()),
+                            },
+                        );
+                        emit_mitm_response_event(
+                            &event_log,
+                            MitmResponseEvent {
+                                started,
+                                target_host: &host,
+                                target_port: port,
+                                request: &http_request,
+                                status: "error",
+                                upstream_status: None,
+                                response_header_bytes: None,
+                                response_body_bytes: None,
+                                error: Some(message.clone()),
+                            },
+                        );
+                        let _ = tls_reader.get_mut().shutdown().await;
+                        ("error", Some(message))
+                    }
+                }
             }
             Ok(Err(error)) => {
                 let message = error.to_string();
@@ -389,6 +469,7 @@ async fn handle_mitm_connect(
                         request: None,
                         status: "error",
                         alpn: alpn.as_deref(),
+                        request_body_bytes: None,
                         error: Some(message.clone()),
                     },
                 );
@@ -405,12 +486,14 @@ async fn handle_mitm_connect(
                         request: None,
                         status: "error",
                         alpn: alpn.as_deref(),
+                        request_body_bytes: None,
                         error: Some(message.clone()),
                     },
                 );
                 ("error", Some(message))
             }
-        };
+        }
+    };
 
     emit_proxy_event(
         &event_log,
@@ -584,6 +667,7 @@ struct MitmRequestEvent<'a> {
     request: Option<&'a ProxyRequest>,
     status: &'a str,
     alpn: Option<&'a str>,
+    request_body_bytes: Option<u64>,
     error: Option<String>,
 }
 
@@ -608,6 +692,9 @@ fn emit_mitm_request_event(event_log: &EventLogHandle, event: MitmRequestEvent<'
         data.insert("path".into(), redact_path_query(&request.target).into());
         data.insert("http_version".into(), request.version.clone().into());
         data.insert("header_bytes".into(), (request.header_bytes as u64).into());
+        if let Some(request_body_bytes) = event.request_body_bytes {
+            data.insert("request_body_bytes".into(), request_body_bytes.into());
+        }
         data.insert(
             "auth_shape".into(),
             Value::Object(proxy_auth_shape(&request.headers)),
@@ -615,6 +702,49 @@ fn emit_mitm_request_event(event_log: &EventLogHandle, event: MitmRequestEvent<'
     }
 
     event_log.emit("mitm_request", Value::Object(data));
+}
+
+struct MitmResponseEvent<'a> {
+    started: Instant,
+    target_host: &'a str,
+    target_port: u16,
+    request: &'a ProxyRequest,
+    status: &'a str,
+    upstream_status: Option<u16>,
+    response_header_bytes: Option<u64>,
+    response_body_bytes: Option<u64>,
+    error: Option<String>,
+}
+
+fn emit_mitm_response_event(event_log: &EventLogHandle, event: MitmResponseEvent<'_>) {
+    let mut data = Map::new();
+    data.insert(
+        "elapsed_ms".into(),
+        (event.started.elapsed().as_millis() as u64).into(),
+    );
+    data.insert("target_host".into(), event.target_host.into());
+    data.insert("target_port".into(), event.target_port.into());
+    data.insert("method".into(), event.request.method.clone().into());
+    data.insert(
+        "path".into(),
+        redact_path_query(&event.request.target).into(),
+    );
+    data.insert("status".into(), event.status.into());
+    data.insert("body_logging".into(), "disabled".into());
+    if let Some(upstream_status) = event.upstream_status {
+        data.insert("upstream_status".into(), upstream_status.into());
+    }
+    if let Some(response_header_bytes) = event.response_header_bytes {
+        data.insert("response_header_bytes".into(), response_header_bytes.into());
+    }
+    if let Some(response_body_bytes) = event.response_body_bytes {
+        data.insert("response_body_bytes".into(), response_body_bytes.into());
+    }
+    if let Some(error) = event.error {
+        data.insert("error".into(), error.into());
+    }
+
+    event_log.emit("mitm_response", Value::Object(data));
 }
 
 fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
@@ -648,24 +778,335 @@ fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
     event_log.emit("proxy_request", Value::Object(data));
 }
 
-async fn write_mitm_http_unimplemented_response<W>(stream: &mut W) -> Result<()>
+async fn write_mitm_http_error_response<W>(
+    stream: &mut W,
+    status_code: u16,
+    reason: &str,
+    error_type: &str,
+    message: &str,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let response_body = br#"{"error":{"message":"Marsala terminated TLS and observed the first decrypted request headers, but upstream MITM forwarding is not implemented in this build","type":"mitm_http_forwarding_unimplemented","source":"marsala"}}"#;
+    let response_body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "source": "marsala"
+        }
+    })
+    .to_string();
     let response = format!(
-        "HTTP/1.1 501 Not Implemented\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        response_body.len()
+        "HTTP/1.1 {status_code} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        response_body.as_bytes().len()
     );
     stream
         .write_all(response.as_bytes())
         .await
-        .context("failed to write MITM HTTP unimplemented response")?;
+        .context("failed to write MITM HTTP error response")?;
     stream
-        .write_all(response_body)
+        .write_all(response_body.as_bytes())
         .await
-        .context("failed to write MITM HTTP unimplemented response body")?;
+        .context("failed to write MITM HTTP error response body")?;
     Ok(())
+}
+
+async fn forward_mitm_http1_request<S>(
+    downstream: &mut BufReader<S>,
+    host: &str,
+    port: u16,
+    request: &ProxyRequest,
+) -> Result<MitmForwardResult>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if is_http2_request(request, None) {
+        write_mitm_http_error_response(
+            downstream.get_mut(),
+            505,
+            "HTTP Version Not Supported",
+            "mitm_http2_unsupported",
+            "Marsala MITM currently supports HTTP/1.1 forwarding only",
+        )
+        .await?;
+        return Ok(MitmForwardResult::rejected(
+            "http2_unsupported",
+            "MITM HTTP/2 forwarding is not implemented",
+        ));
+    }
+
+    if request.version != "HTTP/1.1" {
+        write_mitm_http_error_response(
+            downstream.get_mut(),
+            505,
+            "HTTP Version Not Supported",
+            "mitm_http_version_unsupported",
+            "Marsala MITM currently supports HTTP/1.1 forwarding only",
+        )
+        .await?;
+        return Ok(MitmForwardResult::rejected(
+            "http_version_unsupported",
+            "only HTTP/1.1 MITM forwarding is implemented",
+        ));
+    }
+
+    if is_websocket_upgrade(request) {
+        write_mitm_http_error_response(
+            downstream.get_mut(),
+            501,
+            "Not Implemented",
+            "mitm_websocket_unsupported",
+            "Marsala MITM WebSocket forwarding is not implemented",
+        )
+        .await?;
+        return Ok(MitmForwardResult::rejected(
+            "websocket_unsupported",
+            "MITM WebSocket forwarding is not implemented",
+        ));
+    }
+
+    if header_value(&request.headers, "transfer-encoding").is_some() {
+        write_mitm_http_error_response(
+            downstream.get_mut(),
+            501,
+            "Not Implemented",
+            "mitm_request_body_streaming_unsupported",
+            "Marsala MITM currently supports no-body or bounded Content-Length request bodies only",
+        )
+        .await?;
+        return Ok(MitmForwardResult::rejected(
+            "request_body_streaming_unsupported",
+            "request transfer-encoding is not supported by MITM forwarding",
+        ));
+    }
+
+    let request_body_len = request_content_length(request)?;
+    if request_body_len > MAX_MITM_REQUEST_BODY_BYTES {
+        write_mitm_http_error_response(
+            downstream.get_mut(),
+            413,
+            "Payload Too Large",
+            "mitm_request_body_too_large",
+            "Marsala MITM request body exceeds the bounded forwarding limit",
+        )
+        .await?;
+        return Ok(MitmForwardResult::rejected(
+            "request_body_too_large",
+            "request body exceeds MITM forwarding limit",
+        ));
+    }
+
+    let mut request_body = vec![0u8; request_body_len];
+    if request_body_len > 0 {
+        downstream
+            .read_exact(&mut request_body)
+            .await
+            .context("failed to read bounded MITM request body")?;
+    }
+
+    let mut upstream = connect_upstream_tls(host, port).await?;
+    write_upstream_request(&mut upstream, host, port, request, &request_body).await?;
+
+    let mut upstream_reader = BufReader::new(upstream);
+    let response = read_http_response(&mut upstream_reader).await?;
+    let response_header = serialize_downstream_response(&response);
+    downstream
+        .get_mut()
+        .write_all(response_header.as_bytes())
+        .await
+        .context("failed to write MITM response headers downstream")?;
+    let response_body_bytes = io::copy(&mut upstream_reader, downstream.get_mut())
+        .await
+        .context("failed to stream MITM response body downstream")?;
+
+    Ok(MitmForwardResult {
+        request_status: "forwarded",
+        request_body_bytes: request_body_len as u64,
+        request_error: None,
+        response: Some(MitmResponseResult {
+            status: "forwarded",
+            upstream_status: Some(response.status_code),
+            response_header_bytes: Some(response.header_bytes as u64),
+            response_body_bytes: Some(response_body_bytes),
+            error: None,
+        }),
+        proxy_status: "forwarded",
+        proxy_error: None,
+    })
+}
+
+async fn connect_upstream_tls(
+    host: &str,
+    port: u16,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    ensure_rustls_crypto_provider();
+    let connect_addr = format!("{host}:{port}");
+    let stream = TcpStream::connect(&connect_addr)
+        .await
+        .with_context(|| format!("failed to connect MITM upstream {connect_addr}"))?;
+    let server_name = ServerName::try_from(host.to_string())
+        .with_context(|| format!("invalid MITM upstream DNS name {host}"))?;
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(mitm_upstream_root_store())
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+    connector
+        .connect(server_name, stream)
+        .await
+        .with_context(|| format!("failed MITM upstream TLS handshake with {connect_addr}"))
+}
+
+fn mitm_upstream_root_store() -> RootCertStore {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    add_test_upstream_roots(&mut root_store);
+    root_store
+}
+
+#[cfg(not(test))]
+fn add_test_upstream_roots(_root_store: &mut RootCertStore) {}
+
+#[cfg(test)]
+fn add_test_upstream_roots(root_store: &mut RootCertStore) {
+    for cert in test_upstream_roots()
+        .lock()
+        .expect("test upstream root lock")
+        .iter()
+    {
+        root_store
+            .add(cert.clone())
+            .expect("add test upstream root");
+    }
+}
+
+#[cfg(test)]
+fn trust_test_upstream_root(cert: CertificateDer<'static>) {
+    test_upstream_roots()
+        .lock()
+        .expect("test upstream root lock")
+        .push(cert);
+}
+
+#[cfg(test)]
+fn test_upstream_roots() -> &'static Mutex<Vec<CertificateDer<'static>>> {
+    static ROOTS: OnceLock<Mutex<Vec<CertificateDer<'static>>>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+async fn write_upstream_request<W>(
+    upstream: &mut W,
+    host: &str,
+    port: u16,
+    request: &ProxyRequest,
+    body: &[u8],
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let target = upstream_request_target(&request.target);
+    let mut head = format!("{} {} {}\r\n", request.method, target, request.version);
+    for (name, value) in filter_upstream_request_headers(request) {
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    if header_value(&request.headers, "host").is_none() {
+        head.push_str("host: ");
+        head.push_str(&authority_for_host_header(host, port));
+        head.push_str("\r\n");
+    }
+    head.push_str("connection: close\r\n\r\n");
+    upstream
+        .write_all(head.as_bytes())
+        .await
+        .context("failed to write MITM request headers upstream")?;
+    if !body.is_empty() {
+        upstream
+            .write_all(body)
+            .await
+            .context("failed to write bounded MITM request body upstream")?;
+    }
+    upstream
+        .flush()
+        .await
+        .context("failed to flush MITM request upstream")?;
+    Ok(())
+}
+
+async fn read_http_response<R>(reader: &mut R) -> Result<HttpResponse>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut total_bytes = 0usize;
+    let mut status_line = String::new();
+    let read = reader
+        .read_line(&mut status_line)
+        .await
+        .context("failed to read MITM upstream response status line")?;
+    total_bytes += read;
+    if read == 0 {
+        return Err(anyhow::anyhow!(
+            "upstream closed before MITM response status line"
+        ));
+    }
+    if total_bytes > MAX_HEADER_BYTES {
+        return Err(anyhow::anyhow!("MITM response headers exceeded size limit"));
+    }
+
+    let mut parts = status_line.trim_end().splitn(3, ' ');
+    let version = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing MITM response version"))?
+        .to_string();
+    let status_code = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing MITM response status"))?
+        .parse::<u16>()
+        .context("invalid MITM response status")?;
+    let reason = parts.next().unwrap_or("").to_string();
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .context("failed to read MITM upstream response header")?;
+        total_bytes += read;
+        if read == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if total_bytes > MAX_HEADER_BYTES {
+            return Err(anyhow::anyhow!("MITM response headers exceeded size limit"));
+        }
+        if let Some((name, value)) = line.trim_end().split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+
+    Ok(HttpResponse {
+        version,
+        status_code,
+        reason,
+        headers,
+        header_bytes: total_bytes,
+    })
+}
+
+fn serialize_downstream_response(response: &HttpResponse) -> String {
+    let mut head = format!(
+        "{} {} {}\r\n",
+        response.version, response.status_code, response.reason
+    );
+    for (name, value) in filter_downstream_response_headers(response) {
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    head.push_str("connection: close\r\n\r\n");
+    head
 }
 
 fn mitm_tls_acceptor(config: &MitmConfig, host: &str) -> Result<TlsAcceptor> {
@@ -711,10 +1152,12 @@ fn mitm_server_config(config: &MitmConfig, host: &str) -> Result<ServerConfig> {
     let cert_chain = vec![CertificateDer::from(leaf_cert.der().to_vec())];
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
-    ServerConfig::builder()
+    let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
-        .context("failed to build MITM TLS server config")
+        .context("failed to build MITM TLS server config")?;
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(server_config)
 }
 
 fn ensure_rustls_crypto_provider() {
@@ -728,6 +1171,107 @@ fn ensure_rustls_crypto_provider() {
 fn is_http2_request(request: &ProxyRequest, alpn: Option<&str>) -> bool {
     alpn == Some("h2")
         || (request.method == "PRI" && request.target == "*" && request.version == "HTTP/2.0")
+}
+
+fn is_websocket_upgrade(request: &ProxyRequest) -> bool {
+    header_value(&request.headers, "upgrade")
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+        || header_value(&request.headers, "connection")
+            .map(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            .unwrap_or(false)
+}
+
+fn request_content_length(request: &ProxyRequest) -> Result<usize> {
+    let Some(value) = header_value(&request.headers, "content-length") else {
+        return Ok(0);
+    };
+    value
+        .parse::<usize>()
+        .context("invalid MITM request content-length")
+}
+
+fn upstream_request_target(target: &str) -> String {
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = target.strip_prefix(scheme) {
+            let (_, path) = split_authority_path(rest);
+            return path;
+        }
+    }
+    target.to_string()
+}
+
+fn authority_for_host_header(host: &str, port: u16) -> String {
+    if port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn filter_upstream_request_headers(request: &ProxyRequest) -> Vec<(String, String)> {
+    let connection_tokens = connection_header_tokens(&request.headers);
+    request
+        .headers
+        .iter()
+        .filter(|(name, _)| !is_hop_by_hop_request_header(name, &connection_tokens))
+        .cloned()
+        .collect()
+}
+
+fn filter_downstream_response_headers(response: &HttpResponse) -> Vec<(String, String)> {
+    let connection_tokens = connection_header_tokens(&response.headers);
+    response
+        .headers
+        .iter()
+        .filter(|(name, _)| !is_hop_by_hop_response_header(name, &connection_tokens))
+        .cloned()
+        .collect()
+}
+
+fn connection_header_tokens(headers: &[(String, String)]) -> HashSet<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name == "connection")
+        .flat_map(|(_, value)| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn is_hop_by_hop_request_header(name: &str, connection_tokens: &HashSet<String>) -> bool {
+    connection_tokens.contains(name)
+        || matches!(
+            name,
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
+}
+
+fn is_hop_by_hop_response_header(name: &str, connection_tokens: &HashSet<String>) -> bool {
+    connection_tokens.contains(name)
+        || matches!(
+            name,
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        )
 }
 
 fn add_visible_target_fields(data: &mut Map<String, Value>, request: &ProxyRequest) {
@@ -905,13 +1449,54 @@ struct ProxyRequest {
     header_bytes: usize,
 }
 
+#[derive(Debug)]
+struct HttpResponse {
+    version: String,
+    status_code: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+    header_bytes: usize,
+}
+
+#[derive(Debug)]
+struct MitmForwardResult {
+    request_status: &'static str,
+    request_body_bytes: u64,
+    request_error: Option<String>,
+    response: Option<MitmResponseResult>,
+    proxy_status: &'static str,
+    proxy_error: Option<String>,
+}
+
+impl MitmForwardResult {
+    fn rejected(status: &'static str, message: &str) -> Self {
+        Self {
+            request_status: status,
+            request_body_bytes: 0,
+            request_error: Some(message.to_string()),
+            response: None,
+            proxy_status: status,
+            proxy_error: Some(message.to_string()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MitmResponseResult {
+    status: &'static str,
+    upstream_status: Option<u16>,
+    response_header_bytes: Option<u64>,
+    response_body_bytes: Option<u64>,
+    error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, io::BufReader as StdBufReader};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        sync::watch,
+        sync::{oneshot, watch},
     };
     use tokio_rustls::{
         rustls::{pki_types::ServerName, ClientConfig, RootCertStore},
@@ -995,19 +1580,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowlisted_connect_terminates_tls_and_logs_sanitized_http_request() {
+    async fn allowlisted_connect_forwards_http1_request_to_tls_upstream_and_logs_safely() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let log_path = tempdir.path().join("events.jsonl");
         let mut writer = EventLogWriter::spawn(&log_path, true)
             .await
             .expect("event writer");
+        let (upstream_addr, upstream_request_rx, upstream_task) = spawn_tls_upstream(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello".to_vec(),
+        )
+        .await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut config = AppConfig::default();
         config.proxy.enabled = true;
         config.mitm.enabled = true;
-        config.mitm.allow_hosts = vec!["chatgpt.com".to_string()];
+        config.mitm.allow_hosts = vec!["localhost".to_string()];
         config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
         config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
         init_ca(&config.mitm).expect("init ca");
@@ -1019,51 +1608,36 @@ mod tests {
             shutdown_rx,
         ));
 
-        let mut client = TcpStream::connect(addr).await.expect("connect proxy");
-        client
-            .write_all(
-                b"CONNECT chatgpt.com:443 HTTP/1.1\r\nhost: chatgpt.com:443\r\nproxy-authorization: Basic proxy-secret\r\n\r\n",
-            )
-            .await
-            .expect("write request");
-        let mut connect_response = Vec::new();
-        let mut byte = [0u8; 1];
-        while !connect_response.ends_with(b"\r\n\r\n") {
-            client
-                .read_exact(&mut byte)
-                .await
-                .expect("read connect response");
-            connect_response.push(byte[0]);
-        }
-        let connect_response = String::from_utf8_lossy(&connect_response);
-        assert!(connect_response.contains("200 Connection Established"));
-
-        let mut root_store = RootCertStore::empty();
-        let ca_cert_pem = fs::read(&ca_cert_path).expect("read ca cert");
-        let ca_certs = rustls_pemfile::certs(&mut StdBufReader::new(ca_cert_pem.as_slice()))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse ca certs");
-        assert_eq!(ca_certs.len(), 1);
-        root_store.add(ca_certs[0].clone()).expect("add root ca");
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server_name = ServerName::try_from("chatgpt.com").expect("server name");
-        let mut tls = connector
-            .connect(server_name, client)
-            .await
-            .expect("tls handshake");
+        let mut tls = connect_mitm_client(addr, upstream_addr, &ca_cert_path).await;
         tls.write_all(
-            b"GET /backend-api/codex?api_key=query-secret HTTP/1.1\r\nhost: chatgpt.com\r\nauthorization: Bearer direct-secret\r\ncookie: session=session-secret\r\n\r\n",
+            b"POST /backend-api/codex?api_key=query-secret HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer direct-secret\r\nproxy-authorization: Basic inner-proxy-secret\r\ncookie: session=session-secret\r\nconnection: keep-alive, x-hop\r\nx-hop: remove-me\r\ncontent-length: 4\r\n\r\nping",
         )
         .await
         .expect("write http request");
         let mut response = Vec::new();
         tls.read_to_end(&mut response).await.expect("read response");
         let response = String::from_utf8_lossy(&response);
-        assert!(response.contains("501 Not Implemented"));
-        assert!(response.contains("mitm_http_forwarding_unimplemented"));
+        assert!(response.contains("200 OK"));
+        assert!(response.ends_with("hello"));
+
+        let upstream_request = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        assert_eq!(upstream_request.request.method, "POST");
+        assert_eq!(
+            upstream_request.request.target,
+            "/backend-api/codex?api_key=query-secret"
+        );
+        assert_eq!(upstream_request.body, b"ping");
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "authorization"),
+            Some("Bearer direct-secret".to_string())
+        );
+        assert!(header_value(&upstream_request.request.headers, "proxy-authorization").is_none());
+        assert!(header_value(&upstream_request.request.headers, "x-hop").is_none());
+        assert_eq!(
+            header_value(&upstream_request.request.headers, "connection"),
+            Some("close".to_string())
+        );
 
         shutdown_tx.send(true).expect("shutdown");
         task.await.expect("task").expect("serve listener");
@@ -1071,6 +1645,7 @@ mod tests {
 
         let log_text = fs::read_to_string(&log_path).expect("read log");
         assert!(!log_text.contains("proxy-secret"));
+        assert!(!log_text.contains("inner-proxy-secret"));
         assert!(!log_text.contains("direct-secret"));
         assert!(!log_text.contains("session-secret"));
         assert!(!log_text.contains("query-secret"));
@@ -1085,46 +1660,387 @@ mod tests {
             .expect("proxy request event");
 
         assert_eq!(event["data"]["method"], "CONNECT");
-        assert_eq!(event["data"]["target_host"], "chatgpt.com");
-        assert_eq!(event["data"]["target_port"], 443);
-        assert_eq!(
-            event["data"]["status"],
-            "mitm_http_forwarding_unimplemented"
-        );
+        assert_eq!(event["data"]["target_host"], "localhost");
+        assert_eq!(event["data"]["target_port"], upstream_addr.port());
+        assert_eq!(event["data"]["status"], "forwarded");
         assert_eq!(event["data"]["connect_action"], "mitm");
         assert_eq!(
             event["data"]["auth_shape"]["proxy_authorization_present"],
-            true
+            false
         );
 
         let tls_event = records
             .iter()
             .find(|record| record["event_type"] == "mitm_tls")
             .expect("mitm tls event");
-        assert_eq!(tls_event["data"]["target_host"], "chatgpt.com");
-        assert_eq!(tls_event["data"]["target_port"], 443);
+        assert_eq!(tls_event["data"]["target_host"], "localhost");
+        assert_eq!(tls_event["data"]["target_port"], upstream_addr.port());
         assert_eq!(tls_event["data"]["status"], "handshake_ok");
 
         let request_event = records
             .iter()
             .find(|record| record["event_type"] == "mitm_request")
             .expect("mitm request event");
-        assert_eq!(request_event["data"]["target_host"], "chatgpt.com");
-        assert_eq!(request_event["data"]["target_port"], 443);
-        assert_eq!(request_event["data"]["method"], "GET");
+        assert_eq!(request_event["data"]["target_host"], "localhost");
+        assert_eq!(request_event["data"]["target_port"], upstream_addr.port());
+        assert_eq!(request_event["data"]["method"], "POST");
         assert_eq!(
             request_event["data"]["path"],
             "/backend-api/codex?api_key=[redacted]"
         );
-        assert_eq!(
-            request_event["data"]["status"],
-            "mitm_http_forwarding_unimplemented"
-        );
+        assert_eq!(request_event["data"]["status"], "forwarded");
+        assert_eq!(request_event["data"]["request_body_bytes"], 4);
         assert_eq!(
             request_event["data"]["auth_shape"]["authorization_present"],
             true
         );
         assert_eq!(request_event["data"]["auth_shape"]["cookie_present"], true);
+
+        let response_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_response")
+            .expect("mitm response event");
+        assert_eq!(response_event["data"]["target_host"], "localhost");
+        assert_eq!(response_event["data"]["target_port"], upstream_addr.port());
+        assert_eq!(response_event["data"]["method"], "POST");
+        assert_eq!(
+            response_event["data"]["path"],
+            "/backend-api/codex?api_key=[redacted]"
+        );
+        assert_eq!(response_event["data"]["status"], "forwarded");
+        assert_eq!(response_event["data"]["upstream_status"], 200);
+        assert_eq!(response_event["data"]["response_body_bytes"], 5);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_passes_through_upstream_5xx_response() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let (upstream_addr, upstream_request_rx, upstream_task) = spawn_tls_upstream(
+            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope".to_vec(),
+        )
+        .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = AppConfig::default();
+        config.proxy.enabled = true;
+        config.mitm.enabled = true;
+        config.mitm.allow_hosts = vec!["localhost".to_string()];
+        config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
+        config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        init_ca(&config.mitm).expect("init ca");
+        let ca_cert_path = config.mitm.ca_cert_path.clone();
+        let task = tokio::spawn(serve_listener(
+            listener,
+            config,
+            writer.handle(),
+            shutdown_rx,
+        ));
+
+        let mut tls = connect_mitm_client(addr, upstream_addr, &ca_cert_path).await;
+        tls.write_all(b"GET /failure HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("503 Service Unavailable"));
+        assert!(response.ends_with("nope"));
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("task").expect("serve listener");
+        writer.shutdown().await.expect("writer shutdown");
+
+        let records: Vec<Value> = read_tail_lines(&log_path, 20)
+            .expect("read lines")
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("json"))
+            .collect();
+        let response_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_response")
+            .expect("mitm response event");
+        assert_eq!(response_event["data"]["status"], "forwarded");
+        assert_eq!(response_event["data"]["upstream_status"], 503);
+        assert_eq!(response_event["data"]["response_body_bytes"], 4);
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_connect_tunnel_remains_uninspected() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream addr");
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.expect("accept upstream");
+            let mut request = vec![0u8; 11];
+            stream.read_exact(&mut request).await.expect("read tunnel");
+            assert_eq!(request, b"raw-through");
+            stream
+                .write_all(b"echo:raw-through")
+                .await
+                .expect("write echo");
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = AppConfig::default();
+        config.proxy.enabled = true;
+        config.mitm.enabled = true;
+        config.mitm.allow_hosts = vec!["chatgpt.com".to_string()];
+        config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
+        config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        init_ca(&config.mitm).expect("init ca");
+        let task = tokio::spawn(serve_listener(
+            listener,
+            config,
+            writer.handle(),
+            shutdown_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.expect("connect proxy");
+        client
+            .write_all(
+                format!(
+                    "CONNECT localhost:{} HTTP/1.1\r\nhost: localhost:{}\r\n\r\n",
+                    upstream_addr.port(),
+                    upstream_addr.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write connect");
+        read_connect_response(&mut client).await;
+        client.write_all(b"raw-through").await.expect("write raw");
+        let mut response = vec![0u8; 16];
+        client.read_exact(&mut response).await.expect("read echo");
+        assert_eq!(response, b"echo:raw-through");
+        let _ = client.shutdown().await;
+
+        upstream_task.await.expect("upstream task");
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("task").expect("serve listener");
+        writer.shutdown().await.expect("writer shutdown");
+
+        let records: Vec<Value> = read_tail_lines(&log_path, 20)
+            .expect("read lines")
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("json"))
+            .collect();
+        let event = records
+            .iter()
+            .find(|record| record["event_type"] == "proxy_request")
+            .expect("proxy request event");
+        assert_eq!(event["data"]["connect_action"], "tunnel");
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_tls"
+                && record["event_type"] != "mitm_request"
+                && record["event_type"] != "mitm_response"));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_logs_http2_preface_as_unsupported() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = AppConfig::default();
+        config.proxy.enabled = true;
+        config.mitm.enabled = true;
+        config.mitm.allow_hosts = vec!["localhost".to_string()];
+        config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
+        config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        init_ca(&config.mitm).expect("init ca");
+        let ca_cert_path = config.mitm.ca_cert_path.clone();
+        let task = tokio::spawn(serve_listener(
+            listener,
+            config,
+            writer.handle(),
+            shutdown_rx,
+        ));
+
+        let mut tls = connect_mitm_client_to_target(addr, "localhost:443", &ca_cert_path).await;
+        tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("write h2 preface");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("505 HTTP Version Not Supported"));
+        assert!(response.contains("mitm_http2_unsupported"));
+
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("task").expect("serve listener");
+        writer.shutdown().await.expect("writer shutdown");
+
+        let records: Vec<Value> = read_tail_lines(&log_path, 20)
+            .expect("read lines")
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("json"))
+            .collect();
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "http2_unsupported");
+        assert_eq!(request_event["data"]["method"], "PRI");
+        assert_eq!(request_event["data"]["http_version"], "HTTP/2.0");
+    }
+
+    struct CapturedUpstreamRequest {
+        request: ProxyRequest,
+        body: Vec<u8>,
+    }
+
+    async fn spawn_tls_upstream(
+        response: Vec<u8>,
+    ) -> (
+        SocketAddr,
+        oneshot::Receiver<CapturedUpstreamRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server_config, root_cert) = test_upstream_server_config();
+        trust_test_upstream_root(root_cert);
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let addr = listener.local_addr().expect("upstream local addr");
+        let (request_tx, request_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("upstream accept");
+            let mut tls = acceptor.accept(stream).await.expect("upstream tls accept");
+            let mut reader = BufReader::new(&mut tls);
+            let request = read_proxy_request(&mut reader)
+                .await
+                .expect("read upstream request");
+            let body_len = request_content_length(&request).expect("request content-length");
+            let mut body = vec![0u8; body_len];
+            if body_len > 0 {
+                reader
+                    .read_exact(&mut body)
+                    .await
+                    .expect("read upstream request body");
+            }
+            let _ = request_tx.send(CapturedUpstreamRequest { request, body });
+            reader
+                .get_mut()
+                .write_all(&response)
+                .await
+                .expect("write upstream response");
+            let _ = reader.get_mut().shutdown().await;
+        });
+        (addr, request_rx, task)
+    }
+
+    fn test_upstream_server_config() -> (ServerConfig, CertificateDer<'static>) {
+        ensure_rustls_crypto_provider();
+
+        let ca_key = KeyPair::generate().expect("generate upstream ca key");
+        let mut ca_params = CertificateParams::default();
+        let mut ca_name = DistinguishedName::new();
+        ca_name.push(DnType::CommonName, "Marsala Test Upstream CA");
+        ca_params.distinguished_name = ca_name;
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca_params.self_signed(&ca_key).expect("upstream ca cert");
+        let root_cert = CertificateDer::from(ca_cert.der().to_vec());
+        let issuer = Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key).expect("upstream issuer");
+
+        let leaf_key = KeyPair::generate().expect("generate upstream leaf key");
+        let mut leaf_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
+        let mut leaf_name = DistinguishedName::new();
+        leaf_name.push(DnType::CommonName, "localhost");
+        leaf_params.distinguished_name = leaf_name;
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("upstream leaf cert");
+        let cert_chain = vec![CertificateDer::from(leaf_cert.der().to_vec())];
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .expect("upstream server config");
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        (server_config, root_cert)
+    }
+
+    async fn connect_mitm_client(
+        proxy_addr: SocketAddr,
+        upstream_addr: SocketAddr,
+        ca_cert_path: &std::path::Path,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        connect_mitm_client_to_target(
+            proxy_addr,
+            &format!("localhost:{}", upstream_addr.port()),
+            ca_cert_path,
+        )
+        .await
+    }
+
+    async fn connect_mitm_client_to_target(
+        proxy_addr: SocketAddr,
+        target: &str,
+        ca_cert_path: &std::path::Path,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let mut client = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+        client
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nhost: {target}\r\n\r\n").as_bytes())
+            .await
+            .expect("write connect");
+        read_connect_response(&mut client).await;
+
+        let mut root_store = RootCertStore::empty();
+        let ca_cert_pem = fs::read(ca_cert_path).expect("read ca cert");
+        let ca_certs = rustls_pemfile::certs(&mut StdBufReader::new(ca_cert_pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse ca certs");
+        assert_eq!(ca_certs.len(), 1);
+        root_store.add(ca_certs[0].clone()).expect("add root ca");
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server_name = ServerName::try_from("localhost").expect("server name");
+        connector
+            .connect(server_name, client)
+            .await
+            .expect("tls handshake")
+    }
+
+    async fn read_connect_response(client: &mut TcpStream) {
+        let mut connect_response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !connect_response.ends_with(b"\r\n\r\n") {
+            client
+                .read_exact(&mut byte)
+                .await
+                .expect("read connect response");
+            connect_response.push(byte[0]);
+        }
+        let connect_response = String::from_utf8_lossy(&connect_response);
+        assert!(connect_response.contains("200 Connection Established"));
     }
 
     #[test]

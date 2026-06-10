@@ -18,4 +18,4 @@ Current planning baseline:
 - The mainline milestone is allowlisted MITM for normal ChatGPT-backed Codex traffic.
 - Normal Codex has been observed through Marsala's proxy as tunneled `CONNECT` traffic to `chatgpt.com` and `ab.chatgpt.com`.
 - The custom-provider inbound-auth shortcut to `api.openai.com/v1/responses` was rejected upstream with `401 Unauthorized`.
-- Marsala does not claim decrypted Codex interception until TLS termination and sanitized `mitm_request` metadata are proven.
+- Marsala now has an allowlisted HTTP/1.1 MITM forwarding proof; full normal Codex MITM still depends on validating whether the ChatGPT-backed path requires HTTP/2, WebSocket upgrades, or larger request-body streaming.

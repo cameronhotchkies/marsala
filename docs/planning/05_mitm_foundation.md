@@ -1,6 +1,6 @@
 # MITM Foundation Plan
 
-Status: active mainline. Marsala can generate a local CA and select allowlisted `CONNECT` targets, but it does not decrypt HTTPS traffic yet.
+Status: active mainline. Marsala can generate a local CA, select exact allowlisted `CONNECT` targets, terminate downstream TLS, forward decrypted HTTP/1.1 requests upstream over verified TLS, stream upstream responses downstream, and log sanitized MITM metadata.
 
 ## Decision
 
@@ -40,9 +40,9 @@ ca_key_path = "certs/marsala-ca-key.pem"
 
 Semantics:
 
-- `enabled`: opt-in switch for TLS interception. Today it only validates config; it does not decrypt.
+- `enabled`: opt-in switch for TLS interception of exact allowlisted `CONNECT` hosts.
 - `default_action`: currently only `tunnel` is accepted.
-- `allow_hosts`: exact hostnames eligible for future MITM, for example `api.openai.com` and `chatgpt.com`. URLs, ports, wildcards, and whitespace are rejected.
+- `allow_hosts`: exact hostnames eligible for MITM, for example `api.openai.com` and `chatgpt.com`. URLs, ports, wildcards, and whitespace are rejected.
 - `ca_cert_path`: local root CA certificate path to export and trust in clients.
 - `ca_key_path`: local root CA private key path. The default `certs/` directory is gitignored.
 
@@ -76,9 +76,9 @@ Flow:
 6. Negotiate ALPN deliberately:
    - First pass: advertise/support `http/1.1` only.
    - If Codex requires `h2`, record that as the next blocker and add HTTP/2 support before claiming interception.
-7. Parse the decrypted request with hyper.
-8. Forward method, URI, headers, and streaming body upstream without substituting or logging auth values.
-9. Return upstream status, headers, and streaming body to the client.
+7. Parse the decrypted HTTP/1.1 request headers.
+8. Forward method, URI, sanitized hop-by-hop-filtered headers, and no-body or bounded `Content-Length` bodies upstream without substituting or logging auth values.
+9. Return upstream status, safe headers, and response body stream to the client.
 10. Log sanitized metadata only:
     - event type, peer address, host, port
     - `interception=mitm`
@@ -89,7 +89,7 @@ Flow:
 
 Success criterion for the first steel thread:
 
-- A normal Codex run with `HTTPS_PROXY=http://127.0.0.1:8788` and `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem` produces `mitm_request` metadata for `chatgpt.com` or `ab.chatgpt.com`, including visible method/path/status, with no body or secret material in `logs/events.jsonl`.
+- A normal Codex run with `HTTPS_PROXY=http://127.0.0.1:8788` and `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem` produces `mitm_request` and `mitm_response` metadata for `chatgpt.com` or `ab.chatgpt.com`, including visible method/path/upstream status, with no body or secret material in `logs/events.jsonl`.
 
 ## Blockers And Risks
 
@@ -102,7 +102,7 @@ Success criterion for the first steel thread:
 - Header semantics: hop-by-hop headers and proxy credentials must be removed or handled correctly.
 - Non-allowlisted traffic: accidental wildcard or URL matching would be a security bug; exact host matching is required.
 
-## Next Code Slice
+## Implemented Slices
 
 Completed implementation slices:
 
@@ -113,12 +113,16 @@ Completed implementation slices:
 5. Downstream TLS termination for exact allowlisted hosts.
 6. Sanitized `mitm_tls` and first decrypted HTTP/1.1 `mitm_request` metadata.
 7. Non-allowlisted targets tunnel unchanged.
+8. Upstream TLS connection to the exact allowlisted target host with normal certificate verification.
+9. HTTP/1.1 request forwarding with auth/session headers preserved upstream and proxy/hop-by-hop headers stripped.
+10. Upstream response forwarding without body/chunk logging.
+11. Sanitized `mitm_response` metadata with upstream status, timing, and byte counts.
+12. Explicit unsupported statuses for HTTP/2, WebSocket upgrades, and request transfer-encoding streaming.
 
 Next implementation slice:
 
-1. Open an upstream TLS connection to the exact allowlisted target host with normal certificate verification.
-2. Forward the decrypted HTTP/1.1 request upstream while preserving auth/session headers and stripping proxy/hop-by-hop headers correctly.
-3. Stream the upstream response back downstream without buffering bodies or logging body/chunk content.
-4. Emit sanitized `mitm_response` metadata with status and timing.
-5. Explicitly reject or record unsupported HTTP/2 and WebSocket traffic without claiming full Codex MITM.
-6. Validate with normal Codex before adding body capture, rewrite, or broad forwarding claims.
+1. Validate with normal Codex and record whether the subscription-backed path stays on HTTP/1.1.
+2. Add HTTP/2 forwarding if Codex negotiates or sends `h2`.
+3. Add WebSocket forwarding if the ChatGPT path requires upgrades.
+4. Replace bounded request body buffering with true request-body streaming for chunked or large uploads.
+5. Keep body capture, rewrite, and broad provider expansion out until forwarding is proven.

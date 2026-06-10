@@ -24,6 +24,7 @@ toml.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile = "=3.13.0"

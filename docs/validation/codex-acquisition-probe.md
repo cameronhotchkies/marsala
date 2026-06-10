@@ -182,8 +182,8 @@ Expected: direct `responses_request`; no `proxy_request`.
 - `/v1/responses` WebSocket upgrade/proxying is not implemented; use a custom provider with `model_providers.marsala_responses.supports_websockets=false`.
 - `/v1/chat/completions` streaming passthrough is not implemented; `stream=true` returns local `400 unsupported_streaming`.
 - Plain HTTP proxy forwarding is not implemented; it logs metadata and returns local `501`.
-- HTTPS `CONNECT` is tunneled without MITM, decryption, request body capture, or response body capture.
-- Marsala cannot observe `/v1/responses` paths inside HTTPS tunnels without future opt-in MITM support.
+- Non-allowlisted HTTPS `CONNECT` is tunneled without MITM, decryption, request body capture, or response body capture.
+- Exact allowlisted HTTPS `CONNECT` can be MITM-forwarded for HTTP/1.1 with sanitized metadata; HTTP/2, WebSocket upgrades, and request transfer-encoding streaming remain unsupported.
 - Inbound-auth passthrough to public `api.openai.com` is not the subscription-backed normal Codex success path as currently observed; allowlisted MITM is the main path for discovering the real upstream shape.
 
-See [mitm-steel-thread.md](mitm-steel-thread.md) for the planned allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY` and `CODEX_CA_CERTIFICATE`.
+See [mitm-steel-thread.md](mitm-steel-thread.md) for allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY` and `CODEX_CA_CERTIFICATE`.

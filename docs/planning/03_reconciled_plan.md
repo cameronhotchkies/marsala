@@ -26,7 +26,7 @@ Later promise:
 - A normal ChatGPT-backed Codex run has been observed through Marsala's proxy as HTTPS `CONNECT` traffic to `chatgpt.com` and `ab.chatgpt.com`; those are the current primary MITM targets.
 - `api.openai.com` remains relevant for the API-key gateway and API-billed Codex/custom-provider experiments, but it is not the observed normal subscription-backed Codex host.
 - Codex custom-provider `requires_openai_auth=true` plus inbound auth passthrough was tested against `https://api.openai.com/v1/responses` and reached upstream, but upstream returned `401 Unauthorized`. Treat that path as a failed shortcut unless MITM discovers a different subscription-backed upstream.
-- Marsala does not claim decrypted Codex interception yet. Current normal Codex proxy success is tunneled metadata only until TLS termination lands.
+- Marsala has an allowlisted HTTP/1.1 MITM forwarding proof. Current normal Codex end-to-end success still needs validation through that terminated TLS path, especially for HTTP/2, WebSocket, and request-body streaming requirements.
 - Proxy and allowlisted MITM work move ahead of rewrite, tool-capture semantics, and broad provider expansion.
 - Streaming is observed and preserved before any streaming mutation.
 - Logging is local and useful, but auth headers, proxy credentials, and known secrets are redacted.
