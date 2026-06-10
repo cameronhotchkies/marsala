@@ -111,6 +111,7 @@ impl Default for ServerConfig {
 pub struct OpenAiConfig {
     pub base_url: String,
     pub api_key_env: String,
+    pub auth_mode: OpenAiAuthMode,
 }
 
 impl Default for OpenAiConfig {
@@ -118,6 +119,29 @@ impl Default for OpenAiConfig {
         Self {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
+            auth_mode: OpenAiAuthMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiAuthMode {
+    ConfiguredApiKey,
+    InboundAuthorization,
+}
+
+impl Default for OpenAiAuthMode {
+    fn default() -> Self {
+        Self::ConfiguredApiKey
+    }
+}
+
+impl OpenAiAuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfiguredApiKey => "configured_api_key",
+            Self::InboundAuthorization => "inbound_authorization",
         }
     }
 }
@@ -352,6 +376,7 @@ mod tests {
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8787);
         assert_eq!(config.openai.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.openai.auth_mode, OpenAiAuthMode::ConfiguredApiKey);
         assert!(config.logging.enabled);
         assert!(!config.logging.log_bodies);
         assert!(config.logging.redact_secrets);
@@ -405,6 +430,20 @@ capture_stream_chunks = true
         let config = AppConfig::load(None).expect("load config");
 
         assert_eq!(config.server.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn env_enum_override_parses_openai_auth_mode() {
+        let env_guard = EnvGuard::isolate_marsala();
+
+        env_guard.set("MARSALA__OPENAI__AUTH_MODE", "inbound_authorization");
+
+        let config = AppConfig::load(None).expect("load config");
+
+        assert_eq!(
+            config.openai.auth_mode,
+            OpenAiAuthMode::InboundAuthorization
+        );
     }
 
     #[test]

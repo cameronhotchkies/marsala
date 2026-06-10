@@ -6,7 +6,7 @@ use axum::{
     body::Bytes,
     http::{
         header::{ACCEPT, AUTHORIZATION},
-        HeaderMap, HeaderName, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
     },
 };
 use futures_core::Stream;
@@ -58,11 +58,39 @@ impl ResponsesRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+pub enum UpstreamAuthorization {
+    BearerApiKey(String),
+    InboundAuthorization(HeaderValue),
+}
+
+impl fmt::Debug for UpstreamAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BearerApiKey(_) => formatter.write_str("BearerApiKey([redacted])"),
+            Self::InboundAuthorization(_) => {
+                formatter.write_str("InboundAuthorization([redacted])")
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpstreamRequest {
-    pub api_key: String,
+    pub authorization: UpstreamAuthorization,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for UpstreamRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpstreamRequest")
+            .field("authorization", &self.authorization)
+            .field("headers", &self.headers)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 pub type UpstreamChatRequest = UpstreamRequest;
@@ -158,7 +186,7 @@ impl ReqwestOpenAiCompatibleClient {
         let mut builder = self
             .client
             .post(url)
-            .header(AUTHORIZATION, format!("Bearer {}", request.api_key));
+            .header(AUTHORIZATION, authorization_header(&request.authorization)?);
 
         for (name, value) in &request.headers {
             if name != AUTHORIZATION {
@@ -197,7 +225,7 @@ impl ReqwestOpenAiCompatibleClient {
         let mut builder = self
             .client
             .post(url)
-            .header(AUTHORIZATION, format!("Bearer {}", request.api_key));
+            .header(AUTHORIZATION, authorization_header(&request.authorization)?);
 
         for (name, value) in &request.headers {
             if name != AUTHORIZATION {
@@ -293,6 +321,27 @@ fn should_forward_response_header(name: &HeaderName) -> bool {
         || name.eq_ignore_ascii_case("x-request-id")
         || name.to_ascii_lowercase().starts_with("openai-")
         || name.to_ascii_lowercase().starts_with("x-ratelimit-")
+}
+
+fn authorization_header(
+    authorization: &UpstreamAuthorization,
+) -> Result<HeaderValue, UpstreamError> {
+    match authorization {
+        UpstreamAuthorization::BearerApiKey(api_key) => {
+            let mut value = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|error| {
+                UpstreamError::InvalidResponse(format!(
+                    "configured upstream API key could not be used as an authorization header: {error}"
+                ))
+            })?;
+            value.set_sensitive(true);
+            Ok(value)
+        }
+        UpstreamAuthorization::InboundAuthorization(value) => {
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            Ok(value)
+        }
+    }
 }
 
 fn map_send_error(error: reqwest::Error) -> UpstreamError {
@@ -412,7 +461,7 @@ mod tests {
 
         let response = client
             .send_chat_completions(UpstreamChatRequest {
-                api_key: "sk-test-secret".to_string(),
+                authorization: test_api_key("sk-test-secret"),
                 headers: request_headers(&[
                     ("content-type", "application/json"),
                     ("openai-project", "proj_123"),
@@ -503,7 +552,7 @@ mod tests {
 
         let response = client
             .send_responses(UpstreamResponsesRequest {
-                api_key: "sk-test-secret".to_string(),
+                authorization: test_api_key("sk-test-secret"),
                 headers: request_headers(&[("content-type", "application/json")]),
                 body: br#"{"model":"gpt-5","input":"hi","metadata":{"trace":"abc"}}"#.to_vec(),
             })
@@ -524,6 +573,44 @@ mod tests {
         assert_eq!(json["authorization"], "Bearer sk-test-secret");
         assert_eq!(json["body"]["model"], "gpt-5");
         assert_eq!(json["body"]["metadata"]["trace"], "abc");
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_can_use_inbound_authorization_for_responses() {
+        async fn handler(headers: HeaderMap) -> impl IntoResponse {
+            let auth = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            (
+                StatusCode::OK,
+                [("content-type", HeaderValue::from_static("application/json"))],
+                serde_json::json!({ "authorization": auth }).to_string(),
+            )
+        }
+
+        let (base_url, _server) =
+            spawn_axum_server(Router::new().route("/v1/responses", post(handler))).await;
+        let client = ReqwestOpenAiCompatibleClient::new(&base_url).expect("reqwest client");
+
+        let response = client
+            .send_responses(UpstreamResponsesRequest {
+                authorization: UpstreamAuthorization::InboundAuthorization(
+                    HeaderValue::from_static("Bearer codex-auth-secret"),
+                ),
+                headers: request_headers(&[
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer should-not-win"),
+                ]),
+                body: br#"{"model":"gpt-5","input":"hi"}"#.to_vec(),
+            })
+            .await
+            .expect("upstream response");
+
+        let json: Value = serde_json::from_slice(&response.body).expect("response json");
+        assert_eq!(json["authorization"], "Bearer codex-auth-secret");
     }
 
     #[tokio::test]
@@ -563,7 +650,7 @@ mod tests {
 
         let response = client
             .send_responses_stream(UpstreamResponsesRequest {
-                api_key: "sk-test-secret".to_string(),
+                authorization: test_api_key("sk-test-secret"),
                 headers: request_headers(&[("content-type", "application/json")]),
                 body: br#"{"model":"gpt-5","input":"hi","stream":true}"#.to_vec(),
             })
@@ -617,7 +704,7 @@ mod tests {
 
         let error = client
             .send_chat_completions(UpstreamChatRequest {
-                api_key: "sk-test-secret".to_string(),
+                authorization: test_api_key("sk-test-secret"),
                 headers: request_headers(&[("content-type", "application/json")]),
                 body: br#"{"model":"gpt-4.1-mini","messages":[]}"#.to_vec(),
             })
@@ -650,7 +737,7 @@ mod tests {
 
         let error = client
             .send_chat_completions(UpstreamChatRequest {
-                api_key: "sk-test-secret".to_string(),
+                authorization: test_api_key("sk-test-secret"),
                 headers: request_headers(&[("content-type", "application/json")]),
                 body: br#"{"model":"gpt-4.1-mini","messages":[]}"#.to_vec(),
             })
@@ -700,6 +787,10 @@ mod tests {
         }
 
         headers
+    }
+
+    fn test_api_key(api_key: &str) -> UpstreamAuthorization {
+        UpstreamAuthorization::BearerApiKey(api_key.to_string())
     }
 
     async fn spawn_axum_server(app: Router) -> (String, JoinHandle<()>) {

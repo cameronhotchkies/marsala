@@ -4,8 +4,16 @@ This note validates Marsala as an explicit Codex Responses gateway and metadata-
 
 ## Start Marsala
 
+Configured API-key mode:
+
 ```bash
 OPENAI_API_KEY=sk-... MARSALA__PROXY__ENABLED=true cargo run -p marsala -- serve
+```
+
+Codex-auth passthrough spike mode for `/v1/responses`:
+
+```bash
+MARSALA__OPENAI__AUTH_MODE=inbound_authorization MARSALA__PROXY__ENABLED=true cargo run -p marsala -- serve
 ```
 
 Defaults used by these commands:
@@ -58,6 +66,41 @@ Expected Marsala events:
 
 - `responses_request` with `path=/v1/responses`, `target=upstream`, `stream=true`, `upstream_url=https://api.openai.com/v1/responses`, `auth_shape.authorization_present=true`, and no body field by default.
 - `responses_response` with the upstream status, `source=upstream`, `stream=true`, `stream_status=completed`, `body_bytes`, `body_chunks`, and no body/chunk content by default.
+
+## Custom Provider With Codex Auth Passthrough
+
+This is an empirical spike, not a claimed success path. In `openai.auth_mode=inbound_authorization`, Marsala forwards the inbound `Authorization` header upstream for `POST /v1/responses` instead of loading `openai.api_key_env`. If Codex sends a ChatGPT/Codex session token and OpenAI rejects it on the public Responses API, document that result as an upstream auth rejection.
+
+Start Marsala without requiring `CODEX_API_KEY` or `OPENAI_API_KEY` in Marsala's environment:
+
+```bash
+MARSALA__OPENAI__AUTH_MODE=inbound_authorization cargo run -p marsala -- serve
+```
+
+Then run Codex with a custom provider that asks Codex to attach OpenAI auth:
+
+```bash
+env -u CODEX_API_KEY -u OPENAI_API_KEY \
+  codex exec \
+    -c 'model="gpt-5"' \
+    -c 'model_provider="marsala_responses"' \
+    -c 'model_providers.marsala_responses.name="Marsala Responses"' \
+    -c 'model_providers.marsala_responses.base_url="http://127.0.0.1:8787/v1"' \
+    -c 'model_providers.marsala_responses.requires_openai_auth=true' \
+    -c 'model_providers.marsala_responses.wire_api="responses"' \
+    -c 'model_providers.marsala_responses.supports_websockets=false' \
+    'Reply with one short sentence.'
+```
+
+Expected Marsala events if Codex sends auth:
+
+- `responses_request` with `path=/v1/responses`, `target=upstream`, `auth_mode=inbound_authorization`, `auth_shape.authorization_present=true`, `upstream_headers.authorization=[redacted]`, `upstream_headers.authorization_source=inbound_authorization`, and no `api_key_env`.
+- `responses_response` with the actual upstream status. `2xx` means the token was accepted for this path. `401` or `403` means the passthrough transport worked but upstream rejected the token.
+
+Expected local failure if Codex does not send auth:
+
+- HTTP `401` from Marsala with error type `authorization_error`.
+- `responses_request` with `target=marsala_local`, `auth_mode=inbound_authorization`, and `auth_shape.authorization_present=false`.
 
 ## Proxy Environment Matrix
 

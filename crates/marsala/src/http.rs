@@ -15,7 +15,7 @@ use axum::{
     extract::State,
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE, COOKIE},
-        HeaderMap, HeaderName, Request, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -28,12 +28,13 @@ use serde_json::{Map, Value};
 use tracing::info;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, OpenAiAuthMode},
     event_log::EventLogHandle,
     openai::{
         filter_client_request_headers, filter_upstream_response_headers, ChatCompletionsRequest,
         OpenAiCompatibleClient, ReqwestOpenAiCompatibleClient, ResponsesRequest,
-        UpstreamBodyStream, UpstreamChatRequest, UpstreamError, UpstreamResponsesRequest,
+        UpstreamAuthorization, UpstreamBodyStream, UpstreamChatRequest, UpstreamError,
+        UpstreamResponsesRequest,
     },
 };
 
@@ -117,8 +118,8 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Byte
 
     let request_body = body.to_vec();
 
-    let api_key = match load_api_key(&state.config.openai.api_key_env) {
-        Ok(api_key) => api_key,
+    let upstream_authorization = match responses_upstream_authorization(&state.config, &headers) {
+        Ok(authorization) => authorization,
         Err(message) => {
             emit_responses_request_log(
                 &state,
@@ -132,8 +133,8 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Byte
             return local_responses_error_response(
                 &state,
                 &request_id,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "configuration_error",
+                responses_auth_error_status(state.config.openai.auth_mode),
+                responses_auth_error_type(state.config.openai.auth_mode),
                 &message,
                 started.elapsed().as_millis() as u64,
                 content_type,
@@ -157,7 +158,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Byte
         let upstream_response = state
             .openai_client
             .send_responses_stream(UpstreamResponsesRequest {
-                api_key,
+                authorization: upstream_authorization,
                 headers: upstream_headers,
                 body: request_body,
             })
@@ -225,7 +226,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Byte
     let upstream_response = state
         .openai_client
         .send_responses(UpstreamResponsesRequest {
-            api_key,
+            authorization: upstream_authorization,
             headers: upstream_headers,
             body: request_body,
         })
@@ -401,7 +402,7 @@ async fn chat_completions(
     let upstream_response = state
         .openai_client
         .send_chat_completions(UpstreamChatRequest {
-            api_key,
+            authorization: UpstreamAuthorization::BearerApiKey(api_key),
             headers: upstream_headers,
             body: request_body,
         })
@@ -499,20 +500,27 @@ fn emit_responses_request_log(
     data.insert("method".into(), "POST".into());
     data.insert("path".into(), "/v1/responses".into());
     data.insert("target".into(), target.into());
+    data.insert(
+        "auth_mode".into(),
+        state.config.openai.auth_mode.as_str().into(),
+    );
     data.insert("auth_shape".into(), Value::Object(auth_shape(headers)));
     if target == "upstream" {
         data.insert(
             "upstream_url".into(),
             Value::String(responses_url(&state.config.openai.base_url)),
         );
-        data.insert(
-            "api_key_env".into(),
-            Value::String(state.config.openai.api_key_env.clone()),
-        );
+        if state.config.openai.auth_mode == OpenAiAuthMode::ConfiguredApiKey {
+            data.insert(
+                "api_key_env".into(),
+                Value::String(state.config.openai.api_key_env.clone()),
+            );
+        }
         data.insert(
             "upstream_headers".into(),
             serde_json::json!({
                 "authorization": "[redacted]",
+                "authorization_source": state.config.openai.auth_mode.as_str(),
                 "content-type": content_type,
             }),
         );
@@ -732,6 +740,54 @@ fn load_api_key(api_key_env: &str) -> std::result::Result<String, String> {
         _ => Err(format!(
             "Marsala is missing a configured upstream API key: environment variable {api_key_env} is unset or empty"
         )),
+    }
+}
+
+fn responses_upstream_authorization(
+    config: &AppConfig,
+    headers: &HeaderMap,
+) -> std::result::Result<UpstreamAuthorization, String> {
+    match config.openai.auth_mode {
+        OpenAiAuthMode::ConfiguredApiKey => {
+            load_api_key(&config.openai.api_key_env).map(UpstreamAuthorization::BearerApiKey)
+        }
+        OpenAiAuthMode::InboundAuthorization => {
+            inbound_authorization(headers).map(UpstreamAuthorization::InboundAuthorization)
+        }
+    }
+}
+
+fn inbound_authorization(headers: &HeaderMap) -> std::result::Result<HeaderValue, String> {
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return Err(
+            "Marsala openai.auth_mode is inbound_authorization, but the request did not include an Authorization header to forward upstream"
+                .to_string(),
+        );
+    };
+
+    if value.to_str().is_ok_and(|value| value.trim().is_empty()) {
+        return Err(
+            "Marsala openai.auth_mode is inbound_authorization, but the request Authorization header was empty"
+                .to_string(),
+        );
+    }
+
+    let mut value = value.clone();
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+fn responses_auth_error_status(auth_mode: OpenAiAuthMode) -> StatusCode {
+    match auth_mode {
+        OpenAiAuthMode::ConfiguredApiKey => StatusCode::INTERNAL_SERVER_ERROR,
+        OpenAiAuthMode::InboundAuthorization => StatusCode::UNAUTHORIZED,
+    }
+}
+
+fn responses_auth_error_type(auth_mode: OpenAiAuthMode) -> &'static str {
+    match auth_mode {
+        OpenAiAuthMode::ConfiguredApiKey => "configuration_error",
+        OpenAiAuthMode::InboundAuthorization => "authorization_error",
     }
 }
 
@@ -1067,7 +1123,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::AppConfig,
+        config::{AppConfig, OpenAiAuthMode},
         event_log::{read_tail_lines, EventLogWriter},
         openai::{OpenAiCompatibleClient, UpstreamResponse, UpstreamStreamingResponse},
     };
@@ -1310,7 +1366,10 @@ mod tests {
         assert_eq!(body.as_ref(), br#"{"id":"resp_123","output_text":"hello"}"#);
 
         let upstream_request = stub.first_responses_request();
-        assert_eq!(upstream_request.api_key, "sk-upstream-secret");
+        assert_eq!(
+            upstream_request.authorization,
+            UpstreamAuthorization::BearerApiKey("sk-upstream-secret".to_string())
+        );
         assert_eq!(
             upstream_request
                 .headers
@@ -1354,9 +1413,14 @@ mod tests {
             request["data"]["api_key_env"],
             "PHASE1_OPENAI_API_KEY_RESPONSES_SUCCESS"
         );
+        assert_eq!(request["data"]["auth_mode"], "configured_api_key");
         assert_eq!(
             request["data"]["upstream_headers"]["authorization"],
             "[redacted]"
+        );
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization_source"],
+            "configured_api_key"
         );
         assert_eq!(request["data"]["body_logging"], "disabled");
         assert!(request["data"].get("body").is_none());
@@ -1374,6 +1438,129 @@ mod tests {
             request["data"]["request_id"],
             response["data"]["request_id"]
         );
+    }
+
+    #[tokio::test]
+    async fn responses_inbound_auth_mode_forwards_authorization_and_redacts_logs() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_INBOUND_UNUSED");
+        env_guard.remove();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut config = AppConfig::default();
+        config.logging.enabled = true;
+        config.logging.path = log_path.clone();
+        config.logging.log_bodies = false;
+        config.openai.api_key_env = "PHASE1_OPENAI_API_KEY_RESPONSES_INBOUND_UNUSED".to_string();
+        config.openai.auth_mode = OpenAiAuthMode::InboundAuthorization;
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let stub = Arc::new(StubClient::with_responses(vec![Ok(UpstreamResponse {
+            status: StatusCode::OK,
+            headers: test_headers(&[("content-type", "application/json")]),
+            body: br#"{"id":"resp_123"}"#.to_vec(),
+        })]));
+        let app = build_router_with_client(config, writer.handle(), stub.clone());
+        let request_body = br#"{"model":"gpt-5","input":"hello","token":"body-secret"}"#.to_vec();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer codex-auth-secret")
+                    .body(Body::from(request_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_request = stub.first_responses_request();
+        match upstream_request.authorization {
+            UpstreamAuthorization::InboundAuthorization(value) => {
+                assert_eq!(value.to_str().ok(), Some("Bearer codex-auth-secret"));
+            }
+            other => panic!("expected inbound authorization, got {other:?}"),
+        }
+        assert!(upstream_request.headers.get("authorization").is_none());
+        assert_eq!(upstream_request.body, request_body);
+
+        writer.shutdown().await.expect("writer shutdown");
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("codex-auth-secret"));
+        assert!(!log_text.contains("body-secret"));
+        assert!(!log_text.contains("PHASE1_OPENAI_API_KEY_RESPONSES_INBOUND_UNUSED"));
+
+        let records = read_event_records(&log_path);
+        let request = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_request")
+            .expect("responses request event");
+        assert_eq!(request["data"]["auth_mode"], "inbound_authorization");
+        assert!(request["data"].get("api_key_env").is_none());
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization"],
+            "[redacted]"
+        );
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization_source"],
+            "inbound_authorization"
+        );
+        assert_eq!(request["data"]["auth_shape"]["authorization_present"], true);
+        assert_eq!(
+            request["data"]["auth_shape"]["authorization_scheme"],
+            "bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_inbound_auth_mode_errors_locally_without_authorization() {
+        let env_guard = EnvGuard::preserve("PHASE1_OPENAI_API_KEY_RESPONSES_INBOUND_MISSING");
+        env_guard.remove();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut config = AppConfig::default();
+        config.logging.enabled = true;
+        config.logging.path = log_path.clone();
+        config.openai.api_key_env = "PHASE1_OPENAI_API_KEY_RESPONSES_INBOUND_MISSING".to_string();
+        config.openai.auth_mode = OpenAiAuthMode::InboundAuthorization;
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let stub = Arc::new(StubClient::default());
+        let app = build_router_with_client(config, writer.handle(), stub.clone());
+
+        let response = app
+            .oneshot(post_responses_request(
+                br#"{"model":"gpt-5","input":"hello"}"#.to_vec(),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(stub.request_count(), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["type"], "authorization_error");
+        assert!(json["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("inbound_authorization"));
+
+        writer.shutdown().await.expect("writer shutdown");
+        let records = read_event_records(&log_path);
+        let request = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_request")
+            .expect("responses request event");
+        assert_eq!(request["data"]["target"], "marsala_local");
+        assert_eq!(request["data"]["auth_mode"], "inbound_authorization");
+        assert!(request["data"].get("upstream_headers").is_none());
+        assert!(request["data"].get("api_key_env").is_none());
     }
 
     #[tokio::test]
@@ -1548,7 +1735,10 @@ data: {"id":"resp_123"}
         );
 
         let upstream_request = stub.first_responses_request();
-        assert_eq!(upstream_request.api_key, "sk-upstream-secret");
+        assert_eq!(
+            upstream_request.authorization,
+            UpstreamAuthorization::BearerApiKey("sk-upstream-secret".to_string())
+        );
         assert_eq!(upstream_request.body, request_body);
         assert!(upstream_request.headers.get("authorization").is_none());
         assert_eq!(
@@ -1582,6 +1772,10 @@ data: {"id":"resp_123"}
             request["data"]["upstream_headers"]["authorization"],
             "[redacted]"
         );
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization_source"],
+            "configured_api_key"
+        );
         assert_eq!(request["data"]["auth_shape"]["authorization_present"], true);
         assert_eq!(request["data"]["body_logging"], "disabled");
         assert!(request["data"].get("body").is_none());
@@ -1597,6 +1791,88 @@ data: {"id":"resp_123"}
             request["data"]["request_id"],
             response["data"]["request_id"]
         );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_inbound_auth_mode_forwards_auth_without_logging_chunks() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut config = AppConfig::default();
+        config.logging.enabled = true;
+        config.logging.path = log_path.clone();
+        config.logging.log_bodies = false;
+        config.openai.auth_mode = OpenAiAuthMode::InboundAuthorization;
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let stub = Arc::new(StubClient::with_streaming_responses(vec![Ok(
+            StubStreamingResponse {
+                status: StatusCode::OK,
+                headers: test_headers(&[("content-type", "text/event-stream")]),
+                chunks: vec![Ok(Bytes::from_static(
+                    br#"event: response.output_text.delta
+data: {"delta":"hi","secret":"chunk-secret"}
+
+"#,
+                ))],
+            },
+        )]));
+        let app = build_router_with_client(config, writer.handle(), stub.clone());
+        let request_body =
+            br#"{"model":"gpt-5","input":"hello","stream":true,"token":"body-secret"}"#.to_vec();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer codex-stream-secret")
+                    .body(Body::from(request_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(std::str::from_utf8(&body)
+            .expect("stream body")
+            .contains("chunk-secret"));
+
+        let upstream_request = stub.first_responses_request();
+        match upstream_request.authorization {
+            UpstreamAuthorization::InboundAuthorization(value) => {
+                assert_eq!(value.to_str().ok(), Some("Bearer codex-stream-secret"));
+            }
+            other => panic!("expected inbound authorization, got {other:?}"),
+        }
+
+        writer.shutdown().await.expect("writer shutdown");
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("codex-stream-secret"));
+        assert!(!log_text.contains("body-secret"));
+        assert!(!log_text.contains("chunk-secret"));
+
+        let records = read_event_records(&log_path);
+        let request = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_request")
+            .expect("request event");
+        let response = records
+            .iter()
+            .find(|record| record["event_type"] == "responses_response")
+            .expect("response event");
+        assert_eq!(request["data"]["auth_mode"], "inbound_authorization");
+        assert_eq!(
+            request["data"]["upstream_headers"]["authorization_source"],
+            "inbound_authorization"
+        );
+        assert_eq!(response["data"]["stream_status"], "completed");
+        assert_eq!(response["data"]["body_chunks"], 1);
+        assert!(response["data"].get("body").is_none());
     }
 
     #[tokio::test]
@@ -1832,7 +2108,10 @@ data: {"delta":"partial","secret":"chunk-secret"}
         );
 
         let upstream_request = stub.first_request();
-        assert_eq!(upstream_request.api_key, "sk-upstream-secret");
+        assert_eq!(
+            upstream_request.authorization,
+            UpstreamAuthorization::BearerApiKey("sk-upstream-secret".to_string())
+        );
         assert_eq!(
             upstream_request
                 .headers

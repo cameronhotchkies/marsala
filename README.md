@@ -79,12 +79,15 @@ Current explicit gateway settings:
 
 - `openai.base_url`: upstream base, default `https://api.openai.com/v1`
 - `openai.api_key_env`: env var name that holds the upstream API key, default `OPENAI_API_KEY`
-- Marsala does not read inbound `Authorization` as an upstream fallback
+- `openai.auth_mode`: upstream auth mode, default `configured_api_key`
+- `configured_api_key`: Marsala sends upstream auth from `openai.api_key_env` and strips inbound `Authorization`
+- `inbound_authorization`: `POST /v1/responses` forwards the inbound `Authorization` header upstream; missing inbound auth returns a local `authorization_error`
 - `/v1/chat/completions` and `/v1/responses` forward non-streaming JSON requests to the configured upstream
 - `/v1/responses` with `stream=true` streams upstream bytes through without parsing or mutating chunks
 - `/v1/chat/completions` with `stream=true` is still rejected locally
+- `/v1/chat/completions` still uses `openai.api_key_env`; inbound auth passthrough is intentionally limited to `/v1/responses` for this spike
 
-Codex custom-provider steel thread. Use a custom provider and disable provider WebSockets so Codex uses the HTTP Responses stream path that Marsala currently supports:
+Codex custom-provider steel thread with configured API-key auth. Use a custom provider and disable provider WebSockets so Codex uses the HTTP Responses stream path that Marsala currently supports:
 
 ```bash
 OPENAI_API_KEY=sk-... cargo run -p marsala -- serve
@@ -101,6 +104,25 @@ CODEX_API_KEY=sk-local-routed-through-marsala codex exec \
 ```
 
 Codex sends the local request with the configured custom-provider env key. Marsala forwards upstream using `openai.api_key_env` from its own environment, defaulting to `OPENAI_API_KEY`; inbound `Authorization` is logged only as redacted shape metadata and is not forwarded.
+
+Codex-auth passthrough spike. This mode is empirical: it validates whether Codex will send OpenAI/Codex auth to a custom provider and whether OpenAI accepts that token on the upstream Responses API. Marsala can forward the header, but success depends on upstream accepting the token shape.
+
+```bash
+MARSALA__OPENAI__AUTH_MODE=inbound_authorization cargo run -p marsala -- serve
+
+env -u CODEX_API_KEY -u OPENAI_API_KEY \
+  codex exec \
+    -c 'model="gpt-5"' \
+    -c 'model_provider="marsala_responses"' \
+    -c 'model_providers.marsala_responses.name="Marsala Responses"' \
+    -c 'model_providers.marsala_responses.base_url="http://127.0.0.1:8787/v1"' \
+    -c 'model_providers.marsala_responses.requires_openai_auth=true' \
+    -c 'model_providers.marsala_responses.wire_api="responses"' \
+    -c 'model_providers.marsala_responses.supports_websockets=false' \
+    'Reply with one short sentence.'
+```
+
+Expected local validation: Marsala logs `responses_request` with `auth_mode=inbound_authorization`, `auth_shape.authorization_present=true`, redacted upstream authorization metadata, and no raw token/body/chunk content by default. If upstream rejects the forwarded ChatGPT/Codex token, treat that as the spike result; do not interpret passthrough transport as API authorization success.
 
 Proxy probe settings:
 
