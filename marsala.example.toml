@@ -13,6 +13,10 @@ path = "logs/events.jsonl"
 log_bodies = false
 redact_secrets = true
 capture_stream_chunks = false
+capture_mitm_payloads = false
+capture_mitm_websocket_frames = false
+mitm_payload_preview_bytes = 4096
+mitm_websocket_frame_preview_bytes = 4096
 
 [proxy]
 enabled = false

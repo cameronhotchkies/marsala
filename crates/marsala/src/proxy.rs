@@ -33,7 +33,7 @@ use tokio_rustls::{
 use tracing::{debug, info};
 
 use crate::{
-    config::{AppConfig, MitmConfig, MitmConnectAction},
+    config::{AppConfig, LoggingConfig, MitmConfig, MitmConnectAction},
     event_log::EventLogHandle,
 };
 
@@ -48,6 +48,7 @@ const MITM_RESPONSE_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_WEBSOCKET_INSPECT_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub async fn serve(
     config: AppConfig,
@@ -389,7 +390,16 @@ async fn handle_mitm_connect(
     } else {
         match timeout(HEADER_READ_TIMEOUT, read_proxy_request(&mut tls_reader)).await {
             Ok(Ok(http_request)) => {
-                match forward_mitm_http1_request(&mut tls_reader, &host, port, &http_request).await
+                match forward_mitm_http1_request(
+                    &mut tls_reader,
+                    &host,
+                    port,
+                    &http_request,
+                    &config.logging,
+                    &event_log,
+                    started,
+                )
+                .await
                 {
                     Ok(result) => {
                         emit_mitm_request_event(
@@ -764,6 +774,97 @@ fn emit_mitm_response_event(event_log: &EventLogHandle, event: MitmResponseEvent
     event_log.emit("mitm_response", Value::Object(data));
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PayloadDirection {
+    Request,
+    Response,
+}
+
+impl PayloadDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
+struct MitmPayloadEvent<'a> {
+    started: Instant,
+    target_host: &'a str,
+    target_port: u16,
+    request: &'a ProxyRequest,
+    direction: PayloadDirection,
+    body_bytes: u64,
+    preview: CapturedTextPreview,
+}
+
+fn emit_mitm_payload_event(event_log: &EventLogHandle, event: MitmPayloadEvent<'_>) {
+    let mut data = Map::new();
+    data.insert(
+        "elapsed_ms".into(),
+        (event.started.elapsed().as_millis() as u64).into(),
+    );
+    data.insert("target_host".into(), event.target_host.into());
+    data.insert("target_port".into(), event.target_port.into());
+    data.insert("direction".into(), event.direction.as_str().into());
+    data.insert("method".into(), event.request.method.clone().into());
+    data.insert(
+        "path".into(),
+        redact_path_query(&event.request.target).into(),
+    );
+    data.insert("body_bytes".into(), event.body_bytes.into());
+    data.insert("preview_bytes".into(), event.preview.preview_bytes.into());
+    data.insert("truncated".into(), event.preview.truncated.into());
+    data.insert("utf8".into(), event.preview.utf8.into());
+    if let Some(text) = event.preview.text {
+        data.insert("preview".into(), text.into());
+    }
+
+    event_log.emit("mitm_payload", Value::Object(data));
+}
+
+struct MitmWebSocketFrameEvent<'a> {
+    started: Instant,
+    target_host: &'a str,
+    target_port: u16,
+    request: &'a ProxyRequest,
+    direction: PayloadDirection,
+    opcode: WebSocketOpcode,
+    payload_bytes: u64,
+    preview: Option<CapturedTextPreview>,
+    skipped_payload: bool,
+}
+
+fn emit_mitm_websocket_frame_event(event_log: &EventLogHandle, event: MitmWebSocketFrameEvent<'_>) {
+    let mut data = Map::new();
+    data.insert(
+        "elapsed_ms".into(),
+        (event.started.elapsed().as_millis() as u64).into(),
+    );
+    data.insert("target_host".into(), event.target_host.into());
+    data.insert("target_port".into(), event.target_port.into());
+    data.insert("direction".into(), event.direction.as_str().into());
+    data.insert("method".into(), event.request.method.clone().into());
+    data.insert(
+        "path".into(),
+        redact_path_query(&event.request.target).into(),
+    );
+    data.insert("opcode".into(), event.opcode.as_str().into());
+    data.insert("payload_bytes".into(), event.payload_bytes.into());
+    data.insert("skipped_payload".into(), event.skipped_payload.into());
+    if let Some(preview) = event.preview {
+        data.insert("preview_bytes".into(), preview.preview_bytes.into());
+        data.insert("truncated".into(), preview.truncated.into());
+        data.insert("utf8".into(), preview.utf8.into());
+        if let Some(text) = preview.text {
+            data.insert("preview".into(), text.into());
+        }
+    }
+
+    event_log.emit("mitm_websocket_frame", Value::Object(data));
+}
+
 fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
     let mut data = Map::new();
     data.insert("peer_addr".into(), event.peer_addr.to_string().into());
@@ -833,6 +934,9 @@ async fn forward_mitm_http1_request<S>(
     host: &str,
     port: u16,
     request: &ProxyRequest,
+    logging: &LoggingConfig,
+    event_log: &EventLogHandle,
+    started: Instant,
 ) -> Result<MitmForwardResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -907,7 +1011,10 @@ where
             return Ok(MitmForwardResult::rejected("websocket_malformed", message));
         }
 
-        return forward_mitm_websocket_upgrade(downstream, host, port, request).await;
+        return forward_mitm_websocket_upgrade(
+            downstream, host, port, request, logging, event_log, started,
+        )
+        .await;
     }
 
     if header_value(&request.headers, "transfer-encoding").is_some() {
@@ -986,6 +1093,25 @@ where
         }
     }
 
+    if logging.capture_mitm_payloads {
+        emit_mitm_payload_event(
+            event_log,
+            MitmPayloadEvent {
+                started,
+                target_host: host,
+                target_port: port,
+                request,
+                direction: PayloadDirection::Request,
+                body_bytes: request_body_len as u64,
+                preview: captured_text_preview(
+                    &request_body,
+                    request_body_len as u64,
+                    logging.mitm_payload_preview_bytes,
+                ),
+            },
+        );
+    }
+
     let mut upstream = connect_upstream_tls(host, port).await?;
     write_upstream_request(&mut upstream, host, port, request, &request_body).await?;
 
@@ -1002,35 +1128,94 @@ where
         .write_all(response_header.as_bytes())
         .await
         .context("failed to write MITM response headers downstream")?;
-    let response_body_bytes = match timeout(
-        MITM_RESPONSE_BODY_COPY_TIMEOUT,
-        io::copy(&mut upstream_reader, downstream.get_mut()),
-    )
-    .await
-    {
-        Ok(Ok(response_body_bytes)) => response_body_bytes,
-        Ok(Err(error)) => {
-            return Err(error).context("failed to stream MITM response body downstream")
+    let response_body_copy = if logging.capture_mitm_payloads {
+        match timeout(
+            MITM_RESPONSE_BODY_COPY_TIMEOUT,
+            copy_with_preview(
+                &mut upstream_reader,
+                downstream.get_mut(),
+                logging.mitm_payload_preview_bytes,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(copy)) => copy,
+            Ok(Err(error)) => {
+                return Err(error).context("failed to stream MITM response body downstream")
+            }
+            Err(_) => {
+                let message = "timed out while streaming MITM upstream response body";
+                return Ok(MitmForwardResult {
+                    request_status: "forwarded",
+                    request_body_bytes: request_body_len as u64,
+                    request_error: None,
+                    response: Some(MitmResponseResult {
+                        status: "response_body_timeout",
+                        upstream_status: Some(response.status_code),
+                        response_header_bytes: Some(response.header_bytes as u64),
+                        response_body_bytes: None,
+                        websocket_tunnel_status: None,
+                        error: Some(message.to_string()),
+                    }),
+                    proxy_status: "response_body_timeout",
+                    proxy_error: Some(message.to_string()),
+                });
+            }
         }
-        Err(_) => {
-            let message = "timed out while streaming MITM upstream response body";
-            return Ok(MitmForwardResult {
-                request_status: "forwarded",
-                request_body_bytes: request_body_len as u64,
-                request_error: None,
-                response: Some(MitmResponseResult {
-                    status: "response_body_timeout",
-                    upstream_status: Some(response.status_code),
-                    response_header_bytes: Some(response.header_bytes as u64),
-                    response_body_bytes: None,
-                    websocket_tunnel_status: None,
-                    error: Some(message.to_string()),
-                }),
-                proxy_status: "response_body_timeout",
-                proxy_error: Some(message.to_string()),
-            });
+    } else {
+        let response_body_bytes = match timeout(
+            MITM_RESPONSE_BODY_COPY_TIMEOUT,
+            io::copy(&mut upstream_reader, downstream.get_mut()),
+        )
+        .await
+        {
+            Ok(Ok(response_body_bytes)) => response_body_bytes,
+            Ok(Err(error)) => {
+                return Err(error).context("failed to stream MITM response body downstream")
+            }
+            Err(_) => {
+                let message = "timed out while streaming MITM upstream response body";
+                return Ok(MitmForwardResult {
+                    request_status: "forwarded",
+                    request_body_bytes: request_body_len as u64,
+                    request_error: None,
+                    response: Some(MitmResponseResult {
+                        status: "response_body_timeout",
+                        upstream_status: Some(response.status_code),
+                        response_header_bytes: Some(response.header_bytes as u64),
+                        response_body_bytes: None,
+                        websocket_tunnel_status: None,
+                        error: Some(message.to_string()),
+                    }),
+                    proxy_status: "response_body_timeout",
+                    proxy_error: Some(message.to_string()),
+                });
+            }
+        };
+        CapturedCopy {
+            bytes: response_body_bytes,
+            preview: Vec::new(),
         }
     };
+
+    if logging.capture_mitm_payloads {
+        emit_mitm_payload_event(
+            event_log,
+            MitmPayloadEvent {
+                started,
+                target_host: host,
+                target_port: port,
+                request,
+                direction: PayloadDirection::Response,
+                body_bytes: response_body_copy.bytes,
+                preview: captured_text_preview(
+                    &response_body_copy.preview,
+                    response_body_copy.bytes,
+                    logging.mitm_payload_preview_bytes,
+                ),
+            },
+        );
+    }
 
     Ok(MitmForwardResult {
         request_status: "forwarded",
@@ -1040,7 +1225,7 @@ where
             status: "forwarded",
             upstream_status: Some(response.status_code),
             response_header_bytes: Some(response.header_bytes as u64),
-            response_body_bytes: Some(response_body_bytes),
+            response_body_bytes: Some(response_body_copy.bytes),
             websocket_tunnel_status: None,
             error: None,
         }),
@@ -1054,6 +1239,9 @@ async fn forward_mitm_websocket_upgrade<S>(
     host: &str,
     port: u16,
     request: &ProxyRequest,
+    logging: &LoggingConfig,
+    event_log: &EventLogHandle,
+    started: Instant,
 ) -> Result<MitmForwardResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1137,8 +1325,23 @@ where
         .await
         .context("failed to forward buffered WebSocket upstream bytes downstream")?;
 
-    let tunnel_result =
-        io::copy_bidirectional(downstream.get_mut(), upstream_reader.get_mut()).await;
+    let tunnel_result = if logging.capture_mitm_websocket_frames {
+        copy_bidirectional_with_websocket_capture(
+            downstream.get_mut(),
+            upstream_reader.get_mut(),
+            WebSocketCaptureContext {
+                started,
+                event_log,
+                target_host: host,
+                target_port: port,
+                request,
+                preview_cap: logging.mitm_websocket_frame_preview_bytes,
+            },
+        )
+        .await
+    } else {
+        io::copy_bidirectional(downstream.get_mut(), upstream_reader.get_mut()).await
+    };
     let (status, error) = match tunnel_result {
         Ok(_) => ("websocket_tunnel_closed", None),
         Err(error) => ("websocket_tunnel_error", Some(error.to_string())),
@@ -1419,6 +1622,303 @@ where
         .context("failed to write buffered bytes")?;
     reader.consume(buffered.len());
     Ok(buffered.len() as u64)
+}
+
+#[derive(Debug)]
+struct CapturedCopy {
+    bytes: u64,
+    preview: Vec<u8>,
+}
+
+async fn copy_with_preview<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    preview_cap: usize,
+) -> Result<CapturedCopy>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    let mut bytes = 0u64;
+    let mut preview = Vec::new();
+
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            return Ok(CapturedCopy { bytes, preview });
+        }
+
+        writer.write_all(&buf[..read]).await?;
+        bytes += read as u64;
+        if preview.len() < preview_cap {
+            let remaining = preview_cap - preview.len();
+            preview.extend_from_slice(&buf[..read.min(remaining)]);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedTextPreview {
+    text: Option<String>,
+    preview_bytes: u64,
+    truncated: bool,
+    utf8: bool,
+}
+
+fn captured_text_preview(
+    bytes: &[u8],
+    total_bytes: u64,
+    preview_cap: usize,
+) -> CapturedTextPreview {
+    let preview_len = bytes.len().min(preview_cap);
+    let preview_bytes = &bytes[..preview_len];
+    match std::str::from_utf8(preview_bytes) {
+        Ok(text) => CapturedTextPreview {
+            text: Some(redact_payload_text(text)),
+            preview_bytes: preview_len as u64,
+            truncated: total_bytes > preview_cap as u64,
+            utf8: true,
+        },
+        Err(_) => CapturedTextPreview {
+            text: None,
+            preview_bytes: preview_len as u64,
+            truncated: total_bytes > preview_cap as u64,
+            utf8: false,
+        },
+    }
+}
+
+struct WebSocketCaptureContext<'a> {
+    started: Instant,
+    event_log: &'a EventLogHandle,
+    target_host: &'a str,
+    target_port: u16,
+    request: &'a ProxyRequest,
+    preview_cap: usize,
+}
+
+async fn copy_bidirectional_with_websocket_capture<A, B>(
+    downstream: &mut A,
+    upstream: &mut B,
+    context: WebSocketCaptureContext<'_>,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut downstream_to_upstream = WebSocketFrameInspector::new(PayloadDirection::Request);
+    let mut upstream_to_downstream = WebSocketFrameInspector::new(PayloadDirection::Response);
+    let mut downstream_buf = [0u8; 8192];
+    let mut upstream_buf = [0u8; 8192];
+    let mut client_to_server_bytes = 0u64;
+    let mut server_to_client_bytes = 0u64;
+    let mut downstream_done = false;
+    let mut upstream_done = false;
+
+    while !downstream_done || !upstream_done {
+        tokio::select! {
+            read = downstream.read(&mut downstream_buf), if !downstream_done => {
+                let read = read?;
+                if read == 0 {
+                    downstream_done = true;
+                    upstream.shutdown().await?;
+                } else {
+                    downstream_to_upstream.ingest(&downstream_buf[..read], &context);
+                    upstream.write_all(&downstream_buf[..read]).await?;
+                    client_to_server_bytes += read as u64;
+                }
+            }
+            read = upstream.read(&mut upstream_buf), if !upstream_done => {
+                let read = read?;
+                if read == 0 {
+                    upstream_done = true;
+                    downstream.shutdown().await?;
+                } else {
+                    upstream_to_downstream.ingest(&upstream_buf[..read], &context);
+                    downstream.write_all(&upstream_buf[..read]).await?;
+                    server_to_client_bytes += read as u64;
+                }
+            }
+        }
+    }
+
+    Ok((client_to_server_bytes, server_to_client_bytes))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WebSocketOpcode {
+    Continuation,
+    Text,
+    Binary,
+    Close,
+    Ping,
+    Pong,
+    Other,
+}
+
+impl WebSocketOpcode {
+    fn from_byte(value: u8) -> Self {
+        match value {
+            0x0 => Self::Continuation,
+            0x1 => Self::Text,
+            0x2 => Self::Binary,
+            0x8 => Self::Close,
+            0x9 => Self::Ping,
+            0xA => Self::Pong,
+            _ => Self::Other,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continuation => "continuation",
+            Self::Text => "text",
+            Self::Binary => "binary",
+            Self::Close => "close",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::Other => "other",
+        }
+    }
+}
+
+struct WebSocketFrameInspector {
+    direction: PayloadDirection,
+    buffer: Vec<u8>,
+}
+
+impl WebSocketFrameInspector {
+    fn new(direction: PayloadDirection) -> Self {
+        Self {
+            direction,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn ingest(&mut self, bytes: &[u8], context: &WebSocketCaptureContext<'_>) {
+        self.buffer.extend_from_slice(bytes);
+        while let Some(frame) = self.try_pop_frame() {
+            self.emit_frame(frame, context);
+        }
+
+        if self.buffer.len() > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
+            self.buffer.clear();
+        }
+    }
+
+    fn try_pop_frame(&mut self) -> Option<WebSocketFrame> {
+        if self.buffer.len() < 2 {
+            return None;
+        }
+
+        let opcode = WebSocketOpcode::from_byte(self.buffer[0] & 0x0f);
+        let masked = self.buffer[1] & 0x80 != 0;
+        let mut offset = 2usize;
+        let mut payload_len = (self.buffer[1] & 0x7f) as usize;
+        if payload_len == 126 {
+            if self.buffer.len() < offset + 2 {
+                return None;
+            }
+            payload_len =
+                u16::from_be_bytes([self.buffer[offset], self.buffer[offset + 1]]) as usize;
+            offset += 2;
+        } else if payload_len == 127 {
+            if self.buffer.len() < offset + 8 {
+                return None;
+            }
+            let payload_len_u64 = u64::from_be_bytes([
+                self.buffer[offset],
+                self.buffer[offset + 1],
+                self.buffer[offset + 2],
+                self.buffer[offset + 3],
+                self.buffer[offset + 4],
+                self.buffer[offset + 5],
+                self.buffer[offset + 6],
+                self.buffer[offset + 7],
+            ]);
+            payload_len = payload_len_u64.try_into().ok()?;
+            offset += 8;
+        }
+
+        let mask = if masked {
+            if self.buffer.len() < offset + 4 {
+                return None;
+            }
+            let mask = [
+                self.buffer[offset],
+                self.buffer[offset + 1],
+                self.buffer[offset + 2],
+                self.buffer[offset + 3],
+            ];
+            offset += 4;
+            Some(mask)
+        } else {
+            None
+        };
+
+        let frame_len = offset.checked_add(payload_len)?;
+        if self.buffer.len() < frame_len {
+            return None;
+        }
+
+        let mut payload = self.buffer[offset..frame_len].to_vec();
+        if let Some(mask) = mask {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % 4];
+            }
+        }
+        self.buffer.drain(..frame_len);
+
+        Some(WebSocketFrame { opcode, payload })
+    }
+
+    fn emit_frame(&self, frame: WebSocketFrame, context: &WebSocketCaptureContext<'_>) {
+        match frame.opcode {
+            WebSocketOpcode::Text => {
+                emit_mitm_websocket_frame_event(
+                    context.event_log,
+                    MitmWebSocketFrameEvent {
+                        started: context.started,
+                        target_host: context.target_host,
+                        target_port: context.target_port,
+                        request: context.request,
+                        direction: self.direction,
+                        opcode: frame.opcode,
+                        payload_bytes: frame.payload.len() as u64,
+                        preview: Some(captured_text_preview(
+                            &frame.payload[..frame.payload.len().min(context.preview_cap)],
+                            frame.payload.len() as u64,
+                            context.preview_cap,
+                        )),
+                        skipped_payload: false,
+                    },
+                );
+            }
+            WebSocketOpcode::Binary => {
+                emit_mitm_websocket_frame_event(
+                    context.event_log,
+                    MitmWebSocketFrameEvent {
+                        started: context.started,
+                        target_host: context.target_host,
+                        target_port: context.target_port,
+                        request: context.request,
+                        direction: self.direction,
+                        opcode: frame.opcode,
+                        payload_bytes: frame.payload.len() as u64,
+                        preview: None,
+                        skipped_payload: true,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+struct WebSocketFrame {
+    opcode: WebSocketOpcode,
+    payload: Vec<u8>,
 }
 
 fn mitm_tls_acceptor(config: &MitmConfig, host: &str) -> Result<TlsAcceptor> {
@@ -1855,6 +2355,198 @@ fn redact_path_query(path: &str) -> String {
     format!("{base}?{redacted_query}")
 }
 
+fn redact_payload_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    redacted = redact_header_like_lines(&redacted);
+    redacted = redact_bearer_tokens(&redacted);
+    for key in [
+        "api_key",
+        "api-key",
+        "apikey",
+        "x-api-key",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "session",
+    ] {
+        redacted = redact_key_value_assignments(&redacted, key);
+        redacted = redact_json_string_field(&redacted, key);
+    }
+    redacted = redact_json_string_field(&redacted, "authorization");
+    redacted
+}
+
+fn redact_header_like_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for chunk in text.split_inclusive('\n') {
+        let (line, newline) = chunk
+            .strip_suffix('\n')
+            .map(|line| (line, "\n"))
+            .unwrap_or((chunk, ""));
+        let bare_line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some((name, _value)) = bare_line.split_once(':') {
+            let normalized = name.trim().to_ascii_lowercase();
+            if matches!(
+                normalized.as_str(),
+                "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+            ) {
+                out.push_str(name);
+                out.push_str(": [redacted]");
+                if line.ends_with('\r') {
+                    out.push('\r');
+                }
+                out.push_str(newline);
+                continue;
+            }
+        }
+        out.push_str(chunk);
+    }
+    out
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("bearer ") {
+        let start = cursor + relative;
+        let token_start = start + "bearer ".len();
+        let token_end = text[token_start..]
+            .find(is_secret_value_delimiter)
+            .map(|relative_end| token_start + relative_end)
+            .unwrap_or(text.len());
+        out.push_str(&text[cursor..token_start]);
+        out.push_str("[redacted]");
+        cursor = token_end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn redact_key_value_assignments(text: &str, key: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(relative) = lower[cursor..].find(&key_lower) {
+        let start = cursor + relative;
+        let after_key = start + key_lower.len();
+        if !is_key_boundary(text, start, after_key) {
+            out.push_str(&text[cursor..after_key]);
+            cursor = after_key;
+            continue;
+        }
+
+        let mut separator_start = after_key;
+        while text[separator_start..].starts_with(' ') {
+            separator_start += 1;
+        }
+        if !text[separator_start..].starts_with('=') {
+            out.push_str(&text[cursor..after_key]);
+            cursor = after_key;
+            continue;
+        }
+        let value_start = separator_start + 1;
+        let value_end = text[value_start..]
+            .find(is_secret_value_delimiter)
+            .map(|relative_end| value_start + relative_end)
+            .unwrap_or(text.len());
+        out.push_str(&text[cursor..value_start]);
+        out.push_str("[redacted]");
+        cursor = value_end;
+    }
+
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn redact_json_string_field(text: &str, field: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let needle = format!("\"{}\"", field.to_ascii_lowercase());
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(relative) = lower[cursor..].find(&needle) {
+        let start = cursor + relative;
+        let after_field = start + needle.len();
+        let Some(colon_relative) = text[after_field..].find(':') else {
+            out.push_str(&text[cursor..after_field]);
+            cursor = after_field;
+            continue;
+        };
+        let colon = after_field + colon_relative;
+        if !text[after_field..colon].chars().all(char::is_whitespace) {
+            out.push_str(&text[cursor..after_field]);
+            cursor = after_field;
+            continue;
+        }
+        let mut value_start = colon + 1;
+        value_start = skip_ascii_whitespace(text, value_start);
+        if !text[value_start..].starts_with('"') {
+            out.push_str(&text[cursor..value_start]);
+            cursor = value_start;
+            continue;
+        }
+        let string_start = value_start + 1;
+        let Some(value_len) = json_string_value_len(&text[string_start..]) else {
+            out.push_str(&text[cursor..string_start]);
+            cursor = string_start;
+            continue;
+        };
+        let value_end = string_start + value_len;
+        out.push_str(&text[cursor..string_start]);
+        out.push_str("[redacted]");
+        cursor = value_end;
+    }
+
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn json_string_value_len(text: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn is_key_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.map(is_key_character).unwrap_or(false) && !after.map(is_key_character).unwrap_or(false)
+}
+
+fn skip_ascii_whitespace(text: &str, mut index: usize) -> usize {
+    while index < text.len() && text.as_bytes()[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn is_key_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '-'
+}
+
+fn is_secret_value_delimiter(character: char) -> bool {
+    matches!(
+        character,
+        '&' | ' ' | '\t' | '\r' | '\n' | '"' | '\'' | ',' | ';' | '}' | ']'
+    )
+}
+
 fn should_redact_query_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     let normalized = key.replace('_', "-");
@@ -2189,6 +2881,120 @@ mod tests {
         assert_eq!(response_event["data"]["status"], "forwarded");
         assert_eq!(response_event["data"]["upstream_status"], 200);
         assert_eq!(response_event["data"]["response_body_bytes"], 5);
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_payload"));
+    }
+
+    #[tokio::test]
+    async fn mitm_payload_capture_logs_bounded_redacted_http_previews_when_enabled() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let upstream_body =
+            b"authorization: Bearer response-secret\npayload=abcdefghijklmnopqrstuvwxyz".to_vec();
+        let upstream_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            upstream_body.len(),
+            String::from_utf8_lossy(&upstream_body)
+        )
+        .into_bytes();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_upstream(upstream_response).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = AppConfig::default();
+        config.proxy.enabled = true;
+        config.mitm.enabled = true;
+        config.logging.capture_mitm_payloads = true;
+        config.logging.mitm_payload_preview_bytes = 48;
+        config.mitm.allow_hosts = vec!["localhost".to_string()];
+        config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
+        config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        init_ca(&config.mitm).expect("init ca");
+        let ca_cert_path = config.mitm.ca_cert_path.clone();
+        let task = tokio::spawn(serve_listener(
+            listener,
+            config,
+            writer.handle(),
+            shutdown_rx,
+        ));
+
+        let request_body = b"api_key=request-secret&message=abcdefghijklmnopqrstuvwxyz";
+        let mut tls = connect_mitm_client(addr, upstream_addr, &ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "POST /capture?session=query-secret HTTP/1.1\r\nhost: localhost:{}\r\ncontent-length: {}\r\n\r\n{}",
+                upstream_addr.port(),
+                request_body.len(),
+                String::from_utf8_lossy(request_body)
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+
+        let upstream_request = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        assert_eq!(upstream_request.body, request_body);
+
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("task").expect("serve listener");
+        writer.shutdown().await.expect("writer shutdown");
+
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("request-secret"));
+        assert!(!log_text.contains("response-secret"));
+        assert!(!log_text.contains("query-secret"));
+
+        let records: Vec<Value> = read_tail_lines(&log_path, 20)
+            .expect("read lines")
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("json"))
+            .collect();
+        let payload_events: Vec<_> = records
+            .iter()
+            .filter(|record| record["event_type"] == "mitm_payload")
+            .collect();
+        assert_eq!(payload_events.len(), 2);
+
+        let request_event = payload_events
+            .iter()
+            .find(|record| record["data"]["direction"] == "request")
+            .expect("request payload event");
+        assert_eq!(request_event["data"]["path"], "/capture?session=[redacted]");
+        assert_eq!(
+            request_event["data"]["body_bytes"],
+            request_body.len() as u64
+        );
+        assert_eq!(request_event["data"]["preview_bytes"], 48);
+        assert_eq!(request_event["data"]["truncated"], true);
+        assert_eq!(request_event["data"]["utf8"], true);
+        assert!(request_event["data"]["preview"]
+            .as_str()
+            .expect("request preview")
+            .contains("api_key=[redacted]"));
+
+        let response_event = payload_events
+            .iter()
+            .find(|record| record["data"]["direction"] == "response")
+            .expect("response payload event");
+        assert_eq!(
+            response_event["data"]["body_bytes"],
+            upstream_body.len() as u64
+        );
+        assert_eq!(response_event["data"]["preview_bytes"], 48);
+        assert_eq!(response_event["data"]["truncated"], true);
+        assert!(response_event["data"]["preview"]
+            .as_str()
+            .expect("response preview")
+            .contains("authorization: [redacted]"));
     }
 
     #[tokio::test]
@@ -2666,6 +3472,106 @@ mod tests {
             .find(|record| record["event_type"] == "proxy_request")
             .expect("proxy request event");
         assert_eq!(proxy_event["data"]["status"], "websocket_tunnel_closed");
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_websocket_frame"));
+    }
+
+    #[tokio::test]
+    async fn mitm_websocket_capture_logs_redacted_text_frames_and_skips_binary_payloads() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut logging = LoggingConfig::default();
+        logging.capture_mitm_websocket_frames = true;
+        logging.mitm_websocket_frame_preview_bytes = 128;
+        let fixture = spawn_allowlisted_mitm_proxy_with_logging(&tempdir, logging).await;
+        let client_text =
+            websocket_client_text_frame("api_key=client-ws-secret&message=hello-websocket");
+        let client_binary = websocket_client_binary_frame(b"client-binary-secret");
+        let upstream_text =
+            websocket_server_text_frame("authorization: Bearer upstream-ws-secret\nmessage=ok");
+        let upstream_binary = websocket_server_binary_frame(b"upstream-binary-secret");
+        let client_frames = [client_text.as_slice(), client_binary.as_slice()].concat();
+        let upstream_frames = [upstream_text.as_slice(), upstream_binary.as_slice()].concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(client_frames.clone(), upstream_frames.clone()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /socket?token=query-ws-secret HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let response_head = read_http_response_head(&mut tls).await;
+        assert!(response_head.contains("101 Switching Protocols"));
+
+        tls.write_all(&client_frames)
+            .await
+            .expect("write websocket frames");
+        let mut received = vec![0u8; upstream_frames.len()];
+        tls.read_exact(&mut received)
+            .await
+            .expect("read websocket frames");
+        assert_eq!(received, upstream_frames);
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("client-ws-secret"));
+        assert!(!log_text.contains("upstream-ws-secret"));
+        assert!(!log_text.contains("client-binary-secret"));
+        assert!(!log_text.contains("upstream-binary-secret"));
+        assert!(!log_text.contains("query-ws-secret"));
+
+        let records = read_json_records(&log_path);
+        let frame_events: Vec<_> = records
+            .iter()
+            .filter(|record| record["event_type"] == "mitm_websocket_frame")
+            .collect();
+        assert_eq!(frame_events.len(), 4);
+
+        let request_text = frame_events
+            .iter()
+            .find(|record| {
+                record["data"]["direction"] == "request" && record["data"]["opcode"] == "text"
+            })
+            .expect("request text frame");
+        assert_eq!(request_text["data"]["path"], "/socket?token=[redacted]");
+        assert_eq!(request_text["data"]["skipped_payload"], false);
+        assert!(request_text["data"]["preview"]
+            .as_str()
+            .expect("request text preview")
+            .contains("api_key=[redacted]"));
+
+        let response_text = frame_events
+            .iter()
+            .find(|record| {
+                record["data"]["direction"] == "response" && record["data"]["opcode"] == "text"
+            })
+            .expect("response text frame");
+        assert!(response_text["data"]["preview"]
+            .as_str()
+            .expect("response text preview")
+            .contains("authorization: [redacted]"));
+
+        let binary_events: Vec<_> = frame_events
+            .iter()
+            .filter(|record| record["data"]["opcode"] == "binary")
+            .collect();
+        assert_eq!(binary_events.len(), 2);
+        assert!(binary_events
+            .iter()
+            .all(|record| record["data"]["skipped_payload"] == true));
+        assert!(binary_events
+            .iter()
+            .all(|record| record["data"].get("preview").is_none()));
     }
 
     #[tokio::test]
@@ -2835,6 +3741,13 @@ mod tests {
     }
 
     async fn spawn_allowlisted_mitm_proxy(tempdir: &tempfile::TempDir) -> RunningMitmProxy {
+        spawn_allowlisted_mitm_proxy_with_logging(tempdir, LoggingConfig::default()).await
+    }
+
+    async fn spawn_allowlisted_mitm_proxy_with_logging(
+        tempdir: &tempfile::TempDir,
+        logging: LoggingConfig,
+    ) -> RunningMitmProxy {
         let log_path = tempdir.path().join("events.jsonl");
         let writer = EventLogWriter::spawn(&log_path, true)
             .await
@@ -2845,6 +3758,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.proxy.enabled = true;
         config.mitm.enabled = true;
+        config.logging = logging;
         config.mitm.allow_hosts = vec!["localhost".to_string()];
         config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
         config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
@@ -3116,6 +4030,38 @@ mod tests {
             response.push(byte[0]);
         }
         String::from_utf8_lossy(&response).to_string()
+    }
+
+    fn websocket_client_text_frame(payload: &str) -> Vec<u8> {
+        websocket_frame(0x1, payload.as_bytes(), Some([0x11, 0x22, 0x33, 0x44]))
+    }
+
+    fn websocket_client_binary_frame(payload: &[u8]) -> Vec<u8> {
+        websocket_frame(0x2, payload, Some([0x55, 0x66, 0x77, 0x88]))
+    }
+
+    fn websocket_server_text_frame(payload: &str) -> Vec<u8> {
+        websocket_frame(0x1, payload.as_bytes(), None)
+    }
+
+    fn websocket_server_binary_frame(payload: &[u8]) -> Vec<u8> {
+        websocket_frame(0x2, payload, None)
+    }
+
+    fn websocket_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+        assert!(payload.len() < 126, "test helper supports small frames");
+        let mut frame = Vec::with_capacity(2 + mask.map(|_| 4).unwrap_or(0) + payload.len());
+        frame.push(0x80 | opcode);
+        frame.push(payload.len() as u8 | mask.map(|_| 0x80).unwrap_or(0));
+        if let Some(mask) = mask {
+            frame.extend_from_slice(&mask);
+            for (index, byte) in payload.iter().enumerate() {
+                frame.push(byte ^ mask[index % 4]);
+            }
+        } else {
+            frame.extend_from_slice(payload);
+        }
+        frame
     }
 
     #[test]

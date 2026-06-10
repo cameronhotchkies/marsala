@@ -23,6 +23,8 @@ Defaults used by these commands:
 - Events: `logs/events.jsonl`
 - Body logging: disabled
 - Stream capture: disabled
+- MITM HTTP payload capture: disabled unless `MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS=true`
+- MITM WebSocket text-frame capture: disabled unless `MARSALA__LOGGING__CAPTURE_MITM_WEBSOCKET_FRAMES=true`
 
 Watch logs in another terminal:
 

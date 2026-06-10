@@ -158,6 +158,10 @@ pub struct LoggingConfig {
     pub log_bodies: bool,
     pub redact_secrets: bool,
     pub capture_stream_chunks: bool,
+    pub capture_mitm_payloads: bool,
+    pub capture_mitm_websocket_frames: bool,
+    pub mitm_payload_preview_bytes: usize,
+    pub mitm_websocket_frame_preview_bytes: usize,
 }
 
 impl Default for LoggingConfig {
@@ -168,6 +172,10 @@ impl Default for LoggingConfig {
             log_bodies: false,
             redact_secrets: true,
             capture_stream_chunks: false,
+            capture_mitm_payloads: false,
+            capture_mitm_websocket_frames: false,
+            mitm_payload_preview_bytes: 4096,
+            mitm_websocket_frame_preview_bytes: 4096,
         }
     }
 }
@@ -405,6 +413,10 @@ mod tests {
         assert!(!config.logging.log_bodies);
         assert!(config.logging.redact_secrets);
         assert!(!config.logging.capture_stream_chunks);
+        assert!(!config.logging.capture_mitm_payloads);
+        assert!(!config.logging.capture_mitm_websocket_frames);
+        assert_eq!(config.logging.mitm_payload_preview_bytes, 4096);
+        assert_eq!(config.logging.mitm_websocket_frame_preview_bytes, 4096);
         assert_eq!(config.rewrite.mode, "off");
         assert_eq!(config.rewrite.streaming, "passthrough");
         assert!(!config.proxy.enabled);
@@ -429,12 +441,17 @@ path = "custom/events.jsonl"
 log_bodies = true
 redact_secrets = true
 capture_stream_chunks = true
+capture_mitm_payloads = false
+capture_mitm_websocket_frames = false
+mitm_payload_preview_bytes = 123
+mitm_websocket_frame_preview_bytes = 456
 "#,
         )
         .expect("write config");
 
         env_guard.set("MARSALA__SERVER__HOST", "0.0.0.0");
         env_guard.set("MARSALA__LOGGING__LOG_BODIES", "false");
+        env_guard.set("MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS", "true");
 
         let config = AppConfig::load(Some(&config_path)).expect("load config");
 
@@ -443,6 +460,10 @@ capture_stream_chunks = true
         assert_eq!(config.logging.path, PathBuf::from("custom/events.jsonl"));
         assert!(!config.logging.log_bodies);
         assert!(config.logging.redact_secrets);
+        assert!(config.logging.capture_mitm_payloads);
+        assert!(!config.logging.capture_mitm_websocket_frames);
+        assert_eq!(config.logging.mitm_payload_preview_bytes, 123);
+        assert_eq!(config.logging.mitm_websocket_frame_preview_bytes, 456);
     }
 
     #[test]
