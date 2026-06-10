@@ -120,6 +120,7 @@ async fn serve_command(config: AppConfig) -> Result<()> {
         info!(address = %proxy_local_addr, "marsala proxy probe listening");
         Some(tokio::spawn(proxy::serve_listener(
             proxy_listener,
+            config.clone(),
             event_log.clone(),
             shutdown_rx.clone(),
         )))

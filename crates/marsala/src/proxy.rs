@@ -10,17 +10,20 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::{config::ProxyConfig, event_log::EventLogHandle};
+use crate::{
+    config::{AppConfig, MitmConnectAction},
+    event_log::EventLogHandle,
+};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve(
-    config: ProxyConfig,
+    config: AppConfig,
     event_log: EventLogHandle,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let bind_addr = format!("{}:{}", config.host, config.port);
+    let bind_addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind proxy listener {bind_addr}"))?;
@@ -37,11 +40,12 @@ pub async fn serve(
     );
     info!(address = %local_addr, "marsala proxy probe listening");
 
-    serve_listener(listener, event_log, shutdown).await
+    serve_listener(listener, config, event_log, shutdown).await
 }
 
 pub(crate) async fn serve_listener(
     listener: TcpListener,
+    config: AppConfig,
     event_log: EventLogHandle,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -54,8 +58,9 @@ pub(crate) async fn serve_listener(
             result = listener.accept() => {
                 let (stream, peer_addr) = result.context("failed to accept proxy connection")?;
                 let connection_log = event_log.clone();
+                let connection_config = config.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, peer_addr, connection_log).await {
+                    if let Err(error) = handle_connection(stream, peer_addr, connection_config, connection_log).await {
                         debug!(%error, %peer_addr, "proxy probe connection ended with error");
                     }
                 });
@@ -72,6 +77,7 @@ pub(crate) async fn serve_listener(
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
+    config: AppConfig,
     event_log: EventLogHandle,
 ) -> Result<()> {
     let started = Instant::now();
@@ -86,6 +92,7 @@ async fn handle_connection(
                     peer_addr,
                     request: None,
                     status: "error",
+                    connect_action: None,
                     error: Some(error.to_string()),
                 },
             );
@@ -100,6 +107,7 @@ async fn handle_connection(
                     peer_addr,
                     request: None,
                     status: "error",
+                    connect_action: None,
                     error: Some(message.clone()),
                 },
             );
@@ -108,7 +116,7 @@ async fn handle_connection(
     };
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(reader, peer_addr, event_log, started, request).await
+        handle_connect(reader, peer_addr, config, event_log, started, request).await
     } else {
         handle_plain_http(reader, peer_addr, event_log, started, request).await
     }
@@ -117,6 +125,7 @@ async fn handle_connection(
 async fn handle_connect(
     mut reader: BufReader<TcpStream>,
     peer_addr: SocketAddr,
+    config: AppConfig,
     event_log: EventLogHandle,
     started: Instant,
     request: ProxyRequest,
@@ -134,11 +143,33 @@ async fn handle_connect(
                 peer_addr,
                 request: Some(request),
                 status: "error",
+                connect_action: None,
                 error: Some(message.clone()),
             },
         );
         return Err(anyhow::anyhow!(message));
     };
+
+    let connect_action = match config.mitm_connect_action_for_host(&host) {
+        MitmConnectAction::Mitm => ConnectAction::MitmUnimplemented,
+        MitmConnectAction::Tunnel => ConnectAction::Tunnel,
+    };
+
+    if connect_action == ConnectAction::MitmUnimplemented {
+        write_mitm_unimplemented_response(reader.get_mut()).await?;
+        emit_proxy_event(
+            &event_log,
+            ProxyEvent {
+                started,
+                peer_addr,
+                request: Some(request),
+                status: "mitm_unimplemented",
+                connect_action: Some(connect_action),
+                error: None,
+            },
+        );
+        return Ok(());
+    }
 
     let connect_addr = format!("{host}:{port}");
     let mut upstream = match TcpStream::connect(&connect_addr).await {
@@ -156,6 +187,7 @@ async fn handle_connect(
                     peer_addr,
                     request: Some(request),
                     status: "error",
+                    connect_action: Some(connect_action),
                     error: Some(message.clone()),
                 },
             );
@@ -182,6 +214,7 @@ async fn handle_connect(
             peer_addr,
             request: Some(request),
             status,
+            connect_action: Some(connect_action),
             error,
         },
     );
@@ -219,6 +252,7 @@ async fn handle_plain_http(
             peer_addr,
             request: Some(request),
             status: "not_implemented",
+            connect_action: None,
             error: None,
         },
     );
@@ -287,7 +321,23 @@ struct ProxyEvent<'a> {
     peer_addr: SocketAddr,
     request: Option<ProxyRequest>,
     status: &'a str,
+    connect_action: Option<ConnectAction>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectAction {
+    Tunnel,
+    MitmUnimplemented,
+}
+
+impl ConnectAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tunnel => "tunnel",
+            Self::MitmUnimplemented => "mitm_unimplemented",
+        }
+    }
 }
 
 fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
@@ -299,6 +349,9 @@ fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
     );
     data.insert("status".into(), event.status.into());
     data.insert("body_logging".into(), "disabled".into());
+    if let Some(connect_action) = event.connect_action {
+        data.insert("connect_action".into(), connect_action.as_str().into());
+    }
     if let Some(error) = event.error {
         data.insert("error".into(), error.into());
     }
@@ -316,6 +369,23 @@ fn emit_proxy_event(event_log: &EventLogHandle, event: ProxyEvent<'_>) {
     }
 
     event_log.emit("proxy_request", Value::Object(data));
+}
+
+async fn write_mitm_unimplemented_response(stream: &mut TcpStream) -> Result<()> {
+    let response_body = br#"{"error":{"message":"Marsala selected allowlisted MITM for this CONNECT target, but TLS termination is not implemented in this build","type":"mitm_unimplemented","source":"marsala"}}"#;
+    let response = format!(
+        "HTTP/1.1 501 Not Implemented\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        response_body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("failed to write MITM unimplemented response")?;
+    stream
+        .write_all(response_body)
+        .await
+        .context("failed to write MITM unimplemented response body")?;
+    Ok(())
 }
 
 fn add_visible_target_fields(data: &mut Map<String, Value>, request: &ProxyRequest) {
@@ -515,7 +585,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(serve_listener(listener, writer.handle(), shutdown_rx));
+        let task = tokio::spawn(serve_listener(
+            listener,
+            AppConfig::default(),
+            writer.handle(),
+            shutdown_rx,
+        ));
 
         let mut client = TcpStream::connect(addr).await.expect("connect proxy");
         client
@@ -570,6 +645,70 @@ mod tests {
         );
         assert_eq!(event["data"]["auth_shape"]["cookie_present"], true);
         assert_eq!(event["data"]["auth_shape"]["x_api_key_present"], true);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_connect_returns_mitm_unimplemented_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("events.jsonl");
+        let mut writer = EventLogWriter::spawn(&log_path, true)
+            .await
+            .expect("event writer");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = AppConfig::default();
+        config.proxy.enabled = true;
+        config.mitm.enabled = true;
+        config.mitm.allow_hosts = vec!["api.openai.com".to_string()];
+        let task = tokio::spawn(serve_listener(
+            listener,
+            config,
+            writer.handle(),
+            shutdown_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.expect("connect proxy");
+        client
+            .write_all(
+                b"CONNECT api.openai.com:443 HTTP/1.1\r\nhost: api.openai.com:443\r\nproxy-authorization: Basic proxy-secret\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("501 Not Implemented"));
+        assert!(response.contains("mitm_unimplemented"));
+
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("task").expect("serve listener");
+        writer.shutdown().await.expect("writer shutdown");
+
+        let log_text = fs::read_to_string(&log_path).expect("read log");
+        assert!(!log_text.contains("proxy-secret"));
+        let records: Vec<Value> = read_tail_lines(&log_path, 20)
+            .expect("read lines")
+            .into_iter()
+            .map(|line| serde_json::from_str(&line).expect("json"))
+            .collect();
+        let event = records
+            .iter()
+            .find(|record| record["event_type"] == "proxy_request")
+            .expect("proxy request event");
+
+        assert_eq!(event["data"]["method"], "CONNECT");
+        assert_eq!(event["data"]["target_host"], "api.openai.com");
+        assert_eq!(event["data"]["target_port"], 443);
+        assert_eq!(event["data"]["status"], "mitm_unimplemented");
+        assert_eq!(event["data"]["connect_action"], "mitm_unimplemented");
+        assert_eq!(
+            event["data"]["auth_shape"]["proxy_authorization_present"],
+            true
+        );
     }
 
     #[test]
