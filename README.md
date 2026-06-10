@@ -174,25 +174,17 @@ For API/custom-provider validation, use `MARSALA__MITM__ALLOW_HOSTS=api.openai.c
 Run normal Codex through Marsala's HTTPS proxy and point Codex at the generated CA:
 
 ```bash
-env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
-  HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-  CODEX_CA_CERTIFICATE="$PWD/certs/marsala-ca.pem" \
-  codex exec \
-    --skip-git-repo-check \
-    -c 'approval_policy="never"' \
-    'Reply with one short sentence.'
+just mitm-codex
 ```
 
 Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, forwards decrypted HTTP/1.1 requests and HTTP/1.1 WebSocket upgrades to the same host:port over verified upstream TLS, tunnels WebSocket bytes after upstream `101 Switching Protocols`, and emits sanitized `mitm_request` and `mitm_response` metadata. If payload capture is enabled, Marsala also emits bounded `mitm_payload` and `mitm_websocket_frame` preview events. If Codex uses HTTP/2, a malformed or non-WebSocket upgrade, request-body streaming beyond bounded `Content-Length`, or a response body stalls beyond the steel-thread timeout, Marsala logs an explicit unsupported or timeout status instead of silently forwarding indefinitely.
 
-To inspect local allowlisted MITM payloads for a validation run, add the capture toggles:
+To inspect local allowlisted MITM payloads for a validation run, use the capture-enabled server command:
 
 ```bash
-MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS=true \
-MARSALA__LOGGING__CAPTURE_MITM_WEBSOCKET_FRAMES=true \
-MARSALA__LOGGING__MITM_PAYLOAD_PREVIEW_BYTES=4096 \
-MARSALA__LOGGING__MITM_WEBSOCKET_FRAME_PREVIEW_BYTES=4096 \
-  cargo run -p marsala -- serve
+just mitm-serve-capture
+just mitm-codex
+just payload-logs
 ```
 
 Capture is a local dev-tool feature: keep it off for routine runs, keep `mitm.allow_hosts` exact and narrow, and treat `logs/events.jsonl` as sensitive when enabled.
