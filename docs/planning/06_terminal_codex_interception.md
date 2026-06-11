@@ -40,7 +40,7 @@ export SSL_CERT_FILE=/home/cameron/code/marsala/certs/marsala-ca.pem
 
 ## Proposed Commands
 
-- `just codex-env`
+- [x] `just codex-env`
   - Print the exact shell exports without modifying files.
 - `just install-codex-env`
   - Append or update a marked Marsala block in the user's shell startup file.
@@ -84,7 +84,7 @@ Expected result: the normal `codex` command routes through Marsala and the UI sh
 
 ## Acceptance Criteria
 
-- `just codex-env` prints the intended exports and does not mutate the machine.
+- [x] `just codex-env` prints the intended exports and does not mutate the machine.
 - `just install-codex-env` is idempotent and does not duplicate the Marsala shell block.
 - `just uninstall-codex-env` removes the Marsala shell block and does not remove user-authored shell content.
 - A new terminal session running plain `codex exec ...` emits `proxy_request` events through Marsala when Marsala is running.
@@ -108,4 +108,3 @@ Expected result: the normal `codex` command routes through Marsala and the UI sh
 - Existing user proxy settings could conflict with Marsala. The doctor command must make these conflicts visible.
 - Desktop apps and already-running Codex processes will not inherit new shell exports.
 - Broad shell exports affect every command launched from that terminal, so non-allowlisted traffic must continue to tunnel untouched.
-

@@ -192,6 +192,14 @@ Run normal Codex through Marsala's HTTPS proxy and point Codex at the generated 
 just mitm-codex
 ```
 
+To print the equivalent shell environment for a normal terminal session without modifying any startup files:
+
+```bash
+just codex-env
+```
+
+Apply it to the current shell with `eval "$(just codex-env)"`.
+
 Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, forwards decrypted HTTP/1.1 requests and HTTP/1.1 WebSocket upgrades to the same host:port over verified upstream TLS, tunnels WebSocket bytes after upstream `101 Switching Protocols`, and emits sanitized `mitm_request` and `mitm_response` metadata. If payload capture is enabled, Marsala also emits bounded `mitm_payload` and `mitm_websocket_frame` preview events. If Codex uses HTTP/2, a malformed or non-WebSocket upgrade, request-body streaming beyond bounded `Content-Length`, or a response body stalls beyond the steel-thread timeout, Marsala logs an explicit unsupported or timeout status instead of silently forwarding indefinitely.
 
 To inspect local allowlisted MITM payloads for a validation run, use the browser dashboard with the capture-enabled server command:
