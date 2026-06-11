@@ -82,13 +82,15 @@ codex exec --skip-git-repo-check -c 'approval_policy="never"' 'Reply with one sh
 
 Expected result: the normal `codex` command routes through Marsala and the UI shows allowlisted Codex traffic.
 
+Validation status: complete for applying `just codex-env` to a shell and running plain `codex exec`. On 2026-06-10 PDT, the command completed successfully and produced `proxy_request`, `mitm_tls`, `mitm_request`, and `mitm_response` events for the allowlisted Codex hosts.
+
 ## Acceptance Criteria
 
 - [x] `just codex-env` prints the intended exports and does not mutate the machine.
 - `just install-codex-env` is idempotent and does not duplicate the Marsala shell block.
 - `just uninstall-codex-env` removes the Marsala shell block and does not remove user-authored shell content.
-- A new terminal session running plain `codex exec ...` emits `proxy_request` events through Marsala when Marsala is running.
-- With MITM enabled and trusted, the same run emits `mitm_tls`, `mitm_request`, `mitm_response`, and, when capture is enabled, bounded payload/WebSocket preview events.
+- [x] A new terminal session running plain `codex exec ...` emits `proxy_request` events through Marsala when Marsala is running.
+- [x] With MITM enabled and trusted, the same run emits `mitm_tls`, `mitm_request`, and `mitm_response` events. Bounded payload/WebSocket preview events remain covered by the capture-enabled validation workflow.
 - If Marsala is not running, the doctor command identifies that condition before the user debugs Codex itself.
 - If the CA file is missing or unreadable, the doctor command reports that directly.
 - No raw auth tokens or session cookies are printed by any doctor command.

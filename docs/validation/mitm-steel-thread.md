@@ -151,3 +151,5 @@ Validated on 2026-06-10 PDT with `just mitm-codex` and both CA variables set by 
 - `chatgpt.com` emitted `mitm_tls status=handshake_ok` and forwarded `/backend-api/codex/responses` as an HTTP/1.1 WebSocket upgrade.
 - `ab.chatgpt.com` emitted `mitm_tls status=handshake_ok` and forwarded `POST /otlp/v1/metrics` with upstream status `202`.
 - The run produced no `UnknownCA` event for either allowlisted host.
+
+The terminal environment output was also validated separately on 2026-06-10 PDT by applying `eval "$(just codex-env)"` and then running plain `codex exec`. The command completed successfully, produced the expected model response, and emitted the normal allowlisted proxy and MITM event sequence.
