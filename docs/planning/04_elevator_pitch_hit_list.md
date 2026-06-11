@@ -7,14 +7,14 @@ Marsala is a local-first Rust observability proxy for Codex and OpenAI-shaped tr
 ## Hit List
 
 - Local Rust proxy for seeing what LLM clients actually send and receive.
-- Codex interception viability is the next baseline milestone.
-- Marsala does not claim Codex interception works today.
+- Codex interception is proven for the current allowlisted HTTP/1.1 WebSocket steel thread; reliability and setup are the next baseline milestone.
+- Marsala has demonstrated inspectable normal Codex interception on its allowlisted HTTP/1.1 WebSocket steel thread.
 - Existing OpenAI-compatible ingress remains available: point SDKs at `http://localhost:8787/v1`.
 - Faithful streaming passthrough follows the observed Codex traffic shape before any stream mutation.
 - Local logs with redaction, request IDs, timings, errors, and optional body capture.
 - Response cleanup for non-streaming responses, starting with deterministic filler removal.
 - Tool-call capture by rule, starting with complete calls and later streamed reconstruction.
-- Proxy-env behavior through `HTTP_PROXY` and `HTTPS_PROXY` must be verified, not assumed.
+- Normal Codex routing through `HTTPS_PROXY` is verified; durable terminal setup and trust diagnostics remain productization work.
 - MITM is opt-in, noisy, allowlisted, and disabled by default.
 - Anthropic and local model providers are roadmap items after Codex and OpenAI behavior are stable.
 
@@ -33,4 +33,4 @@ Marsala is a local-first Rust observability proxy for Codex and OpenAI-shaped tr
 
 ## One-Liner
 
-Marsala is a local Rust proxy that keeps an explicit OpenAI gateway available while proving Codex interception the hard way, without pretending proxy envs, MITM, and streaming mutation are simple plumbing.
+Marsala is a local Rust proxy that keeps an explicit OpenAI gateway available while making normal Codex traffic inspectable through narrow, allowlisted MITM.

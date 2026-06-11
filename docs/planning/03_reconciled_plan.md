@@ -26,7 +26,7 @@ Later promise:
 - A normal ChatGPT-backed Codex run has been observed through Marsala's proxy as HTTPS `CONNECT` traffic to `chatgpt.com` and `ab.chatgpt.com`; those are the current primary MITM targets.
 - `api.openai.com` remains relevant for the API-key gateway and API-billed Codex/custom-provider experiments, but it is not the observed normal subscription-backed Codex host.
 - Codex custom-provider `requires_openai_auth=true` plus inbound auth passthrough was tested against `https://api.openai.com/v1/responses` and reached upstream, but upstream returned `401 Unauthorized`. Treat that path as a failed shortcut unless MITM discovers a different subscription-backed upstream.
-- Marsala has an allowlisted HTTP/1.1 MITM forwarding proof. Current normal Codex end-to-end success still needs validation through that terminated TLS path, especially for HTTP/2, WebSocket, and request-body streaming requirements.
+- Marsala has intercepted a successful normal Codex run through allowlisted HTTP/1.1 MITM, including the `/backend-api/codex/responses` WebSocket path and decoded request payload previews.
 - Proxy and allowlisted MITM work move ahead of rewrite, tool-capture semantics, and broad provider expansion.
 - Streaming is observed and preserved before any streaming mutation.
 - Logging is local and useful, but auth headers, proxy credentials, and known secrets are redacted.
@@ -39,11 +39,11 @@ Later promise:
 - [x] Proxy env baseline: normal Codex traffic can be routed through Marsala with `HTTPS_PROXY`.
 - [x] Initial normal Codex hosts: observed `chatgpt.com:443` and `ab.chatgpt.com:443` through `CONNECT`; unrelated `github.com:443` also appears and must not be MITM'd by default.
 - [x] Inbound auth shortcut result: ChatGPT/Codex auth forwarded to `api.openai.com/v1/responses` returns `401 Unauthorized`.
-- [ ] Decrypted normal Codex endpoint paths: still unknown until allowlisted MITM TLS termination succeeds.
-- [ ] API surface on normal Codex path: whether decrypted traffic uses Responses, ChatGPT backend APIs, WebSocket, or another endpoint family.
-- [ ] Streaming shape: framing, chunk ordering, completion markers, and cancellation behavior Marsala must preserve.
+- [x] Decrypted normal Codex endpoint path: observed `/backend-api/codex/responses`.
+- [x] API surface on normal Codex path: observed an HTTP/1.1 WebSocket upgrade on the ChatGPT backend Codex Responses path.
+- [x] Baseline streaming transport: observed WebSocket text frames with `permessage-deflate`; Marsala preserves forwarded bytes and decodes bounded previews while maintaining inflate context.
 - [ ] Auth and session forwarding: which inbound auth headers, bearer tokens, cookies, session headers, or device identifiers must pass through unchanged, and what must always be redacted.
-- [ ] TLS, MITM, and cert trust requirements: whether `CODEX_CA_CERTIFICATE` is sufficient, and whether Codex requires HTTP/2, WebSocket, ALPN behavior, or has certificate pinning.
+- [ ] TLS trust hardening: validate `CODEX_CA_CERTIFICATE` plus `SSL_CERT_FILE` across normal Codex connection paths and classify intermittent `UnknownCA` failures.
 
 ## Recommended Defaults
 
@@ -144,7 +144,7 @@ Non-goals:
 
 ## Phase 1: Codex Traffic Acquisition Baseline
 
-Status: partially complete. Normal Codex can be routed through Marsala's proxy and completes successfully when tunneled. Decrypted payload inspection is not complete.
+Status: complete for the current Codex steel thread. Normal Codex has been routed through Marsala, decrypted on the allowlisted MITM path, and observed using `/backend-api/codex/responses` over WebSocket.
 
 Goal: route normal ChatGPT-backed Codex traffic through Marsala and identify the exact allowlisted hosts needed for payload inspection.
 
@@ -186,7 +186,7 @@ Acceptance gates:
 
 Goal: route real Codex traffic through Marsala with explicit proxy behavior and observable tunnel/intercept outcomes.
 
-Status: tunnel baseline complete for normal Codex. `CONNECT` metadata is logged with target host/port and action. Allowlisted MITM can now terminate downstream TLS for exact configured hosts, emit sanitized `mitm_tls` metadata, and record the first decrypted HTTP/1.1 request metadata when available. Upstream MITM forwarding is still the active blocker.
+Status: complete for the current HTTP/1.1 baseline. `CONNECT` metadata is logged with target host/port and action; non-allowlisted traffic tunnels; allowlisted MITM terminates downstream TLS and forwards HTTP/1.1 requests, responses, and WebSocket upgrades upstream.
 
 Scope:
 
@@ -215,23 +215,25 @@ Scope:
 
 - Implement and validate the trust path:
   - local CA generation
-  - CA export and trust setup with `CODEX_CA_CERTIFICATE`
+  - CA export and trust setup with `CODEX_CA_CERTIFICATE` and `SSL_CERT_FILE`
   - per-host certificate generation for exact allowlisted hosts
   - explicit failure behavior when trust is missing
 - [x] Terminate downstream TLS for allowlisted hosts and log handshake metadata without secrets.
 - [x] Parse enough decrypted HTTP to record method, redacted path, and auth shape.
-- [ ] Forward decrypted HTTP/1.1 requests upstream and stream responses back without logging bodies or credentials.
-- [ ] Record upstream status metadata after forwarding is implemented.
+- [x] Forward bounded decrypted HTTP/1.1 requests and responses without logging bodies or credentials by default.
+- [x] Record upstream status metadata.
+- [x] Forward allowlisted HTTP/1.1 WebSocket upgrades and tunnel bytes after upstream `101 Switching Protocols`.
+- [x] Capture bounded, redacted HTTP body and WebSocket text-frame previews behind explicit local-only toggles.
 - Record TLS transport details that affect feasibility: `CONNECT`, SNI, ALPN, HTTP/2, and certificate pinning behavior.
 - Keep interception allowlisted and opt-in.
 
 Acceptance gates:
 
-- Normal Codex run produces `mitm_tls` and then `mitm_request` metadata for `chatgpt.com` or `ab.chatgpt.com`.
+- Normal Codex run produces `mitm_tls`, `mitm_request`, and `mitm_response` metadata for `chatgpt.com` or `ab.chatgpt.com`.
 - Logs contain no raw bearer token, cookie, request body, response body, or stream chunk content by default.
 - Non-allowlisted HTTPS targets, including `github.com`, still tunnel and do not produce decrypted metadata.
 - Any requirement for local CA trust is recorded with exact setup steps and failure modes.
-- No doc claims inspectable Codex interception unless this phase has been proven.
+- A captured normal Codex run includes a decoded request frame containing the user prompt on `/backend-api/codex/responses`.
 
 ## Phase 4: Logging And Redaction Hardening
 

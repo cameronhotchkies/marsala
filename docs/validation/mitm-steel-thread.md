@@ -91,6 +91,7 @@ In another terminal, run normal Codex through the proxy:
 ```bash
 env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
   HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+  CODEX_CA_CERTIFICATE="$PWD/certs/marsala-ca.pem" \
   SSL_CERT_FILE="$PWD/certs/marsala-ca.pem" \
   codex exec \
     --skip-git-repo-check \
@@ -113,9 +114,9 @@ Expected today:
 - Stalled upstream response bodies are logged with `response_body_timeout`; this proof does not provide unbounded response streaming.
 - Non-allowlisted HTTPS targets, including observed `github.com` traffic, still tunnel and do not produce `mitm_tls` or `mitm_request`.
 
-## CA Fallback
+## CA Trust Isolation
 
-If a client does not honor `CODEX_CA_CERTIFICATE`, test the generic CA variable separately:
+The normal validation path sets both CA variables. If trust still fails, test each variable independently to identify which TLS path is rejecting the generated CA. The following command isolates the Codex-specific variable:
 
 ```bash
 env HTTPS_PROXY=http://127.0.0.1:8788 https_proxy=http://127.0.0.1:8788 \
@@ -136,8 +137,8 @@ Still missing:
 - HTTP/2 forwarding
 - WebSocket forwarding outside the exact allowlisted HTTP/1.1 upgrade steel thread
 - request body streaming for chunked or otherwise unbounded bodies
-- validation that a normal ChatGPT-backed Codex run stays on HTTP/1.1 and succeeds through the terminated TLS path
+- hardened CA trust diagnostics for intermittent downstream trust failures
 
 Safety invariant by default: `logs/events.jsonl` must contain no raw bearer token, cookie, request body, response body, stream chunk content, or WebSocket frame bytes. With payload capture enabled, `logs/events.jsonl` may contain redacted, bounded HTTP body and WebSocket text previews and should be handled as sensitive local data.
 
-Do not claim full Codex MITM until a normal Codex run succeeds through the terminated TLS path.
+Do not claim support beyond the validated HTTP/1.1 WebSocket steel thread until those transports are implemented and tested.

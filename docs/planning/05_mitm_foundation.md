@@ -49,8 +49,7 @@ Semantics:
 Trust guidance for the next implementation slice:
 
 - Export the CA certificate from `mitm.ca_cert_path`.
-- For Codex, test with `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem`.
-- For generic rustls/reqwest/OpenSSL-based clients, test `SSL_CERT_FILE=$PWD/certs/marsala-ca.pem` only when that client honors it.
+- For Codex, set both `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem` and `SSL_CERT_FILE=$PWD/certs/marsala-ca.pem` so Codex-specific and generic TLS paths trust the same local CA.
 - Do not require system trust-store installation for the first validation; document it later as optional platform-specific setup.
 
 ## First Steel Thread
@@ -89,7 +88,7 @@ Flow:
 
 Success criterion for the first steel thread:
 
-- A normal Codex run with `HTTPS_PROXY=http://127.0.0.1:8788` and `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem` produces `mitm_request` and `mitm_response` metadata for `chatgpt.com` or `ab.chatgpt.com`, including visible method/path/upstream status, with no body or secret material in `logs/events.jsonl`.
+- A normal Codex run with `HTTPS_PROXY=http://127.0.0.1:8788`, `CODEX_CA_CERTIFICATE=$PWD/certs/marsala-ca.pem`, and `SSL_CERT_FILE=$PWD/certs/marsala-ca.pem` produces `mitm_request` and `mitm_response` metadata for `chatgpt.com` or `ab.chatgpt.com`, including visible method/path/upstream status, with no body or secret material in `logs/events.jsonl` by default.
 
 ## Blockers And Risks
 

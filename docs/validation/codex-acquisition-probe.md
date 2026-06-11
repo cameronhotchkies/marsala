@@ -188,4 +188,4 @@ Expected: direct `responses_request`; no `proxy_request`.
 - Exact allowlisted HTTPS `CONNECT` can be MITM-forwarded for HTTP/1.1 with sanitized metadata, including HTTP/1.1 WebSocket `101 Switching Protocols` tunnels to the same CONNECT host:port; HTTP/2 and request transfer-encoding streaming remain unsupported.
 - Inbound-auth passthrough to public `api.openai.com` is not the subscription-backed normal Codex success path as currently observed; allowlisted MITM is the main path for discovering the real upstream shape.
 
-See [mitm-steel-thread.md](mitm-steel-thread.md) for allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY` and `CODEX_CA_CERTIFICATE`.
+See [mitm-steel-thread.md](mitm-steel-thread.md) for allowlisted MITM validation commands using normal Codex with `HTTPS_PROXY`, `CODEX_CA_CERTIFICATE`, and `SSL_CERT_FILE`.
