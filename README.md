@@ -76,8 +76,8 @@ export MARSALA__SERVER__PORT=9797
 export MARSALA__LOGGING__LOG_BODIES=true
 export MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS=true
 export MARSALA__LOGGING__CAPTURE_MITM_WEBSOCKET_FRAMES=true
-export MARSALA__LOGGING__MITM_PAYLOAD_PREVIEW_BYTES=4096
-export MARSALA__LOGGING__MITM_WEBSOCKET_FRAME_PREVIEW_BYTES=4096
+export MARSALA__LOGGING__MITM_PAYLOAD_PREVIEW_BYTES=65536
+export MARSALA__LOGGING__MITM_WEBSOCKET_FRAME_PREVIEW_BYTES=65536
 export OPENAI_API_KEY=sk-...
 ```
 
@@ -140,7 +140,7 @@ Proxy probe settings:
 - Body logging and stream capture are disabled by default
 - Allowlisted MITM HTTP body preview capture is disabled by default; enable it with `logging.capture_mitm_payloads=true` or `MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS=true`
 - Allowlisted MITM WebSocket text-frame preview capture is disabled by default; enable it with `logging.capture_mitm_websocket_frames=true` or `MARSALA__LOGGING__CAPTURE_MITM_WEBSOCKET_FRAMES=true`
-- Preview caps default to `logging.mitm_payload_preview_bytes=4096` and `logging.mitm_websocket_frame_preview_bytes=4096`; captured text runs through lightweight local redaction before it is written to JSONL
+- Config preview caps default to `logging.mitm_payload_preview_bytes=4096` and `logging.mitm_websocket_frame_preview_bytes=4096`; `just ui` and `just mitm-serve-capture` raise both to `65536` so real Codex request envelopes are inspectable. Captured text runs through lightweight local redaction before it is written to JSONL
 - WebSocket upgrade/proxy support on the explicit `/v1/responses` gateway is not implemented; WebSocket forwarding exists only for exact allowlisted MITM HTTP/1.1 `Upgrade: websocket` requests
 
 MITM foundation settings:
@@ -185,6 +185,12 @@ To inspect local allowlisted MITM payloads for a validation run, use the browser
 
 ```bash
 just ui
+```
+
+`just ui` defaults to 64 KiB HTTP/WebSocket previews. For a deeper run, pass a larger cap:
+
+```bash
+just ui 262144
 ```
 
 Open `http://127.0.0.1:8787/ui`, then run traffic through the proxy:

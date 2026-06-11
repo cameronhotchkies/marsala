@@ -65,11 +65,11 @@ Payload inspection is off by default. The exact local-only toggles are:
 ```bash
 MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS=true
 MARSALA__LOGGING__CAPTURE_MITM_WEBSOCKET_FRAMES=true
-MARSALA__LOGGING__MITM_PAYLOAD_PREVIEW_BYTES=4096
-MARSALA__LOGGING__MITM_WEBSOCKET_FRAME_PREVIEW_BYTES=4096
+MARSALA__LOGGING__MITM_PAYLOAD_PREVIEW_BYTES=65536
+MARSALA__LOGGING__MITM_WEBSOCKET_FRAME_PREVIEW_BYTES=65536
 ```
 
-The TOML equivalents are `logging.capture_mitm_payloads`, `logging.capture_mitm_websocket_frames`, `logging.mitm_payload_preview_bytes`, and `logging.mitm_websocket_frame_preview_bytes`. Keep capture disabled for routine validation. When enabled, treat `logs/events.jsonl` as sensitive local inspection output even though obvious bearer tokens, API-key/token/session query parameters, cookie-ish header lines, and obvious JSON secret fields are redacted.
+The TOML equivalents are `logging.capture_mitm_payloads`, `logging.capture_mitm_websocket_frames`, `logging.mitm_payload_preview_bytes`, and `logging.mitm_websocket_frame_preview_bytes`. The config defaults remain 4096 bytes, but `just ui` and `just mitm-serve-capture` use 65536 bytes for practical Codex inspection. Keep capture disabled for routine validation. When enabled, treat `logs/events.jsonl` as sensitive local inspection output even though obvious bearer tokens, API-key/token/session query parameters, cookie-ish header lines, and obvious JSON secret fields are redacted.
 
 ## TLS Termination And HTTP/1.1 Forwarding Proof
 
