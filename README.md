@@ -200,6 +200,14 @@ just codex-env
 
 Apply it to the current shell with `eval "$(just codex-env)"`.
 
+For persistent Bash setup, install a marked environment block once:
+
+```bash
+just install-codex-env
+```
+
+New interactive terminals print `[marsala] Codex interception environment enabled; proxy expected at 127.0.0.1:8788`. The block uses absolute CA paths, does not wrap or replace `codex`, and does not change the current directory, so `codex` can be launched from any project directory. Remove only the marked block with `just uninstall-codex-env`.
+
 Expected for this slice: Marsala logs the `CONNECT` metadata, emits `mitm_tls` with `status=handshake_ok` for exact allowlisted ChatGPT hosts, forwards decrypted HTTP/1.1 requests and HTTP/1.1 WebSocket upgrades to the same host:port over verified upstream TLS, tunnels WebSocket bytes after upstream `101 Switching Protocols`, and emits sanitized `mitm_request` and `mitm_response` metadata. If payload capture is enabled, Marsala also emits bounded `mitm_payload` and `mitm_websocket_frame` preview events. If Codex uses HTTP/2, a malformed or non-WebSocket upgrade, request-body streaming beyond bounded `Content-Length`, or a response body stalls beyond the steel-thread timeout, Marsala logs an explicit unsupported or timeout status instead of silently forwarding indefinitely.
 
 To inspect local allowlisted MITM payloads for a validation run, use the browser dashboard with the capture-enabled server command:
@@ -250,6 +258,8 @@ The container overrides a runtime setting:
 - `logs tail`: print the last JSONL entries, with optional `--follow`
 - `logs tail --follow`: prints one waiting message to stderr when `logs/events.jsonl` does not exist yet, then resumes on file creation or recreation
 - `mitm ca init`: generate `mitm.ca_cert_path` and `mitm.ca_key_path` without overwriting existing files
+- `codex env install`: install the marked Bash startup block, defaulting to `~/.bashrc`
+- `codex env uninstall`: remove only the marked Bash startup block
 
 ## Interception UI
 

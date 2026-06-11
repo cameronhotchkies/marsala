@@ -33,6 +33,42 @@ pub enum Command {
     Logs(LogsArgs),
     #[command(about = "Manage allowlisted MITM foundation assets")]
     Mitm(MitmArgs),
+    #[command(about = "Manage Codex interception integration")]
+    Codex(CodexArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CodexArgs {
+    #[command(subcommand)]
+    pub command: CodexCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CodexCommand {
+    #[command(about = "Manage terminal environment integration")]
+    Env(CodexEnvArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CodexEnvArgs {
+    #[command(subcommand)]
+    pub command: CodexEnvCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CodexEnvCommand {
+    #[command(about = "Install the marked Bash startup block")]
+    Install(CodexEnvFileArgs),
+    #[command(about = "Remove the marked Bash startup block")]
+    Uninstall(CodexEnvFileArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CodexEnvFileArgs {
+    #[arg(long, help = "Shell startup file; defaults to ~/.bashrc")]
+    pub shell_file: Option<PathBuf>,
+    #[arg(long, help = "Marsala project directory containing certs/")]
+    pub project_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

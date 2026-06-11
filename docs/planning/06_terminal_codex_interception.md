@@ -17,6 +17,8 @@ This feature makes Marsala usable as the default local observation layer for Cod
 - The hook must not replace, rename, wrap, or shadow the `codex` executable.
 - The hook must not edit Codex auth files or `~/.codex/config.toml`.
 - The hook must be clearly marked, idempotent, and removable.
+- A new interactive terminal must state explicitly that Marsala interception is enabled.
+- The hook must use absolute paths and must not change the terminal's working directory.
 - Marsala must provide a doctor command that explains whether a new terminal is ready to intercept Codex.
 
 ## Environment Contract
@@ -42,11 +44,11 @@ export SSL_CERT_FILE=/home/cameron/code/marsala/certs/marsala-ca.pem
 
 - [x] `just codex-env`
   - Print the exact shell exports without modifying files.
-- `just install-codex-env`
+- [x] `just install-codex-env`
   - Append or update a marked Marsala block in the user's shell startup file.
   - Default target for this environment: `~/.bashrc`.
   - Refuse to proceed if the CA file is missing.
-- `just uninstall-codex-env`
+- [x] `just uninstall-codex-env`
   - Remove only the marked Marsala block.
   - Leave unrelated shell content untouched.
 - `just codex-env-doctor`
@@ -82,13 +84,16 @@ codex exec --skip-git-repo-check -c 'approval_policy="never"' 'Reply with one sh
 
 Expected result: the normal `codex` command routes through Marsala and the UI shows allowlisted Codex traffic.
 
+The new terminal prints `[marsala] Codex interception environment enabled; proxy expected at 127.0.0.1:8788`. This is an environment hook only: `codex` remains the original executable and starts in whatever directory the user selected.
+
 Validation status: complete for applying `just codex-env` to a shell and running plain `codex exec`. On 2026-06-10 PDT, the command completed successfully and produced `proxy_request`, `mitm_tls`, `mitm_request`, and `mitm_response` events for the allowlisted Codex hosts.
 
 ## Acceptance Criteria
 
 - [x] `just codex-env` prints the intended exports and does not mutate the machine.
-- `just install-codex-env` is idempotent and does not duplicate the Marsala shell block.
-- `just uninstall-codex-env` removes the Marsala shell block and does not remove user-authored shell content.
+- [x] `just install-codex-env` is idempotent and does not duplicate the Marsala shell block.
+- [x] `just uninstall-codex-env` removes the Marsala shell block and does not remove user-authored shell content.
+- [x] The installed hook uses absolute CA paths, announces interception in interactive Bash, and preserves the caller's working directory.
 - [x] A new terminal session running plain `codex exec ...` emits `proxy_request` events through Marsala when Marsala is running.
 - [x] With MITM enabled and trusted, the same run emits `mitm_tls`, `mitm_request`, and `mitm_response` events. Bounded payload/WebSocket preview events remain covered by the capture-enabled validation workflow.
 - If Marsala is not running, the doctor command identifies that condition before the user debugs Codex itself.

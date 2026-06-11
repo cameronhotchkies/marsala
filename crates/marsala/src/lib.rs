@@ -1,5 +1,6 @@
 pub mod certs;
 pub mod cli;
+pub mod codex_env;
 pub mod config;
 pub mod event_log;
 pub mod http;
@@ -12,7 +13,9 @@ use std::{future::IntoFuture, sync::Once, time::Duration};
 use anyhow::{Context, Result};
 use axum::serve;
 use clap::Parser;
-use cli::{CaCommand, Cli, Command, ConfigCommand, LogsCommand, MitmCommand};
+use cli::{
+    CaCommand, Cli, CodexCommand, CodexEnvCommand, Command, ConfigCommand, LogsCommand, MitmCommand,
+};
 use config::AppConfig;
 use event_log::EventLogWriter;
 use tokio::{net::TcpListener, sync::watch};
@@ -56,6 +59,44 @@ pub async fn run() -> Result<()> {
                         "trust for Codex with: CODEX_CA_CERTIFICATE={}",
                         created.cert_path.display()
                     );
+                    Ok(())
+                }
+            },
+        },
+        Command::Codex(args) => match args.command {
+            CodexCommand::Env(args) => match args.command {
+                CodexEnvCommand::Install(args) => {
+                    let shell_file = args
+                        .shell_file
+                        .map(Ok)
+                        .unwrap_or_else(codex_env::default_shell_file)?;
+                    let project_dir = args.project_dir.unwrap_or(
+                        std::env::current_dir().context("failed to read current directory")?,
+                    );
+                    codex_env::install(&project_dir, &shell_file)?;
+                    println!(
+                        "installed Marsala Codex interception in {}",
+                        shell_file.display()
+                    );
+                    println!("open a new terminal; Codex can then be launched from any directory");
+                    Ok(())
+                }
+                CodexEnvCommand::Uninstall(args) => {
+                    let shell_file = args
+                        .shell_file
+                        .map(Ok)
+                        .unwrap_or_else(codex_env::default_shell_file)?;
+                    if codex_env::uninstall(&shell_file)? {
+                        println!(
+                            "removed Marsala Codex interception from {}",
+                            shell_file.display()
+                        );
+                    } else {
+                        println!(
+                            "no Marsala Codex interception block found in {}",
+                            shell_file.display()
+                        );
+                    }
                     Ok(())
                 }
             },

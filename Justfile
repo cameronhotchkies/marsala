@@ -43,6 +43,12 @@ codex-env:
         'export CODEX_CA_CERTIFICATE={{justfile_directory()}}/certs/marsala-ca.pem' \
         'export SSL_CERT_FILE={{justfile_directory()}}/certs/marsala-ca.pem'
 
+install-codex-env:
+    cargo run -p marsala -- codex env install --project-dir '{{justfile_directory()}}'
+
+uninstall-codex-env:
+    cargo run -p marsala -- codex env uninstall
+
 logs:
     cargo run -p marsala -- logs tail --lines 80 --follow
 
