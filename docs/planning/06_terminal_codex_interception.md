@@ -34,8 +34,8 @@ export ALL_PROXY=
 export all_proxy=
 export NO_PROXY=
 export no_proxy=
-export CODEX_CA_CERTIFICATE=/home/cameron/code/marsala/certs/marsala-ca.pem
-export SSL_CERT_FILE=/home/cameron/code/marsala/certs/marsala-ca.pem
+export CODEX_CA_CERTIFICATE=/absolute/path/to/marsala/certs/marsala-ca.pem
+export SSL_CERT_FILE=/absolute/path/to/marsala/certs/marsala-ca.pem
 ```
 
 `HTTPS_PROXY` routes Codex HTTPS and WebSocket traffic through Marsala. `CODEX_CA_CERTIFICATE` is the Codex-specific trust hook. `SSL_CERT_FILE` is the fallback for any TLS client path that does not consult the Codex-specific variable.
