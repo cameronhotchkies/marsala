@@ -6,6 +6,8 @@ Make Marsala's local CA trust path reliable and diagnosable for normal Codex MIT
 
 The current certificate generation path appears structurally correct: Marsala creates a local CA and signs per-host leaf certificates with host SANs. The remaining failure mode observed in validation is trust propagation into the exact Codex process or TLS stack that opens the connection.
 
+Validation status: complete for the dual-CA-variable normal Codex run. On 2026-06-10 PDT, `just mitm-codex` completed successfully with both `CODEX_CA_CERTIFICATE` and `SSL_CERT_FILE`; `chatgpt.com` and `ab.chatgpt.com` both emitted `mitm_tls status=handshake_ok`, and the `ab.chatgpt.com` metrics request was forwarded successfully. Structured failure classification and doctor commands remain open below.
+
 ## Product Requirements
 
 - Treat CA trust as a first-class validation surface, not a footnote in manual commands.
@@ -77,7 +79,7 @@ The UI should make this visible without forcing the user to grep JSONL:
   - the private key parses
   - current env points both CA variables at the public cert
 - `just ca-doctor` reports actionable failures for missing files or missing env vars.
-- A normal Codex run with the correct env shows `mitm_tls status=handshake_ok` for allowlisted ChatGPT hosts.
+- [x] A normal Codex run with the correct env shows `mitm_tls status=handshake_ok` for allowlisted ChatGPT hosts.
 - A normal Codex run with the CA env intentionally omitted shows a clear trust failure in logs and in the doctor output.
 - The UI distinguishes CA trust failure from unsupported HTTP/2 or upstream forwarding failure.
 - Tests cover CA doctor parsing/classification without requiring network access.
@@ -95,4 +97,3 @@ The UI should make this visible without forcing the user to grep JSONL:
 - Whether some Codex paths only honor `SSL_CERT_FILE`.
 - Whether GUI-launched Codex or app-server flows need separate environment propagation.
 - Whether `ab.chatgpt.com` failures are pure trust propagation issues or a distinct TLS client path.
-

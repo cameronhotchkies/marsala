@@ -142,3 +142,12 @@ Still missing:
 Safety invariant by default: `logs/events.jsonl` must contain no raw bearer token, cookie, request body, response body, stream chunk content, or WebSocket frame bytes. With payload capture enabled, `logs/events.jsonl` may contain redacted, bounded HTTP body and WebSocket text previews and should be handled as sensitive local data.
 
 Do not claim support beyond the validated HTTP/1.1 WebSocket steel thread until those transports are implemented and tested.
+
+## Dual-Variable Validation Result
+
+Validated on 2026-06-10 PDT with `just mitm-codex` and both CA variables set by the recipe:
+
+- Codex completed successfully and returned the expected response.
+- `chatgpt.com` emitted `mitm_tls status=handshake_ok` and forwarded `/backend-api/codex/responses` as an HTTP/1.1 WebSocket upgrade.
+- `ab.chatgpt.com` emitted `mitm_tls status=handshake_ok` and forwarded `POST /otlp/v1/metrics` with upstream status `202`.
+- The run produced no `UnknownCA` event for either allowlisted host.
