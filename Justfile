@@ -23,6 +23,8 @@ mitm-serve-capture preview_bytes='65536':
 
 ui preview_bytes='65536':
     @echo "Marsala interception UI: http://127.0.0.1:8787/ui"
+    @echo "CODEX_CA_CERTIFICATE={{justfile_directory()}}/certs/marsala-ca.pem"
+    @echo "SSL_CERT_FILE={{justfile_directory()}}/certs/marsala-ca.pem"
     MARSALA__PROXY__ENABLED=true MARSALA__MITM__ENABLED=true MARSALA__MITM__ALLOW_HOSTS=chatgpt.com,ab.chatgpt.com MARSALA__LOGGING__CAPTURE_MITM_PAYLOADS=true MARSALA__LOGGING__CAPTURE_MITM_WEBSOCKET_FRAMES=true MARSALA__LOGGING__MITM_PAYLOAD_PREVIEW_BYTES={{preview_bytes}} MARSALA__LOGGING__MITM_WEBSOCKET_FRAME_PREVIEW_BYTES={{preview_bytes}} cargo run -p marsala -- serve
 
 mitm-codex prompt='Reply with one short sentence.':

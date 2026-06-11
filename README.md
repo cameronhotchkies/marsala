@@ -220,6 +220,8 @@ Open `http://127.0.0.1:8787/ui`, then run traffic through the proxy:
 just mitm-codex
 ```
 
+At startup, `just ui` prints the expected `CODEX_CA_CERTIFICATE` and `SSL_CERT_FILE` paths alongside the dashboard URL.
+
 The dashboard provides a two-pane live timeline and detail/payload preview view with category, host, path substring, payload-only, pause/resume, and clear controls. Raw JSONL remains available with `cargo run -p marsala -- logs tail --lines 80 --follow` or `just logs` when debugging the event file itself.
 
 Capture is a local dev-tool feature: keep it off for routine runs, keep `mitm.allow_hosts` exact and narrow, and treat `logs/events.jsonl` and the browser UI contents as sensitive when enabled.

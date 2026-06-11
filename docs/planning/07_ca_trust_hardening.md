@@ -45,7 +45,7 @@ Validation status: complete for the dual-CA-variable normal Codex run. On 2026-0
   - Include proxy env checks from the terminal-wide interception spec.
 - `just ui`
   - Continue to run capture-enabled Marsala.
-  - Should print the expected CA env values beside the UI URL once the terminal hook work exists.
+  - [x] Print the expected `CODEX_CA_CERTIFICATE` and `SSL_CERT_FILE` values beside the UI URL.
 
 ## Logging And UI Requirements
 
