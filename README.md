@@ -1,8 +1,21 @@
 # Marsala
 
-Marsala currently ships a local-first Rust service skeleton with non-streaming OpenAI-shaped chat completions and Responses forwarding, plus streaming passthrough for `POST /v1/responses` with `stream=true`. It starts cleanly, loads config from TOML and env, exposes `GET /healthz`, `POST /v1/chat/completions`, and `POST /v1/responses`, writes JSONL events, and shuts down on `Ctrl-C`.
+Marsala is a local-first interception workbench for Codex and other developer LLM tools. Its core job is simple: show what your AI tooling is actually sending and receiving, keep that evidence local, and create a controlled place to inspect and eventually shape those flows.
 
-That explicit gateway remains supported as a compatibility path for Codex custom providers. The proxy/MITM path is the mainline for normal ChatGPT-backed Codex: non-allowlisted HTTPS is tunneled with metadata logging, and exact allowlisted hosts can be TLS-terminated so HTTP/1.1 requests and HTTP/1.1 WebSocket upgrades are forwarded upstream over verified TLS with sanitized `mitm_request` and `mitm_response` metadata. Optional local-only MITM payload inspection can log bounded, redacted HTTP body and WebSocket text-frame previews when explicitly enabled. Marsala still does not implement stream chunk capture, HTTP/2 MITM forwarding, WebSocket forwarding outside the allowlisted HTTP/1.1 upgrade steel thread, unbounded request-body streaming, or unbounded MITM response streaming.
+The product baseline is normal ChatGPT-backed Codex traffic, not the OpenAI-compatible gateway. Marsala runs as a local HTTP proxy, observes Codex `CONNECT` traffic, and can TLS-terminate exact allowlisted Codex hosts so the live UI and JSONL event log show sanitized request, response, and WebSocket metadata. When local payload capture is explicitly enabled, Marsala also records bounded, redacted previews of HTTP bodies and WebSocket text frames.
+
+The compatibility gateway still exists because it is useful for fixtures and custom-provider experiments: Marsala exposes `POST /v1/chat/completions` and `POST /v1/responses`, including streaming passthrough for `POST /v1/responses` with `stream=true`. That path is not the main product proof. The mainline is allowlisted MITM for normal Codex.
+
+Current steel thread:
+
+- Run Marsala locally with the interception UI at `http://127.0.0.1:8787/ui`.
+- Route Codex through Marsala's proxy on `127.0.0.1:8788`.
+- MITM only exact allowlisted Codex hosts such as `chatgpt.com` and `ab.chatgpt.com`.
+- Tunnel unrelated hosts, including observed `github.com` traffic.
+- Capture payload previews only when explicitly enabled.
+- Keep generated CA material and captured traffic local.
+
+Still intentionally limited: Marsala does not implement stream chunk capture, HTTP/2 MITM forwarding, WebSocket forwarding outside the allowlisted HTTP/1.1 upgrade steel thread, unbounded request-body streaming, or unbounded MITM response streaming.
 
 ## Prerequisites
 
