@@ -14,7 +14,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Query, State},
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE},
+        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, ORIGIN},
         HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
     },
     middleware::{self, Next},
@@ -23,7 +23,7 @@ use axum::{
     Json, Router,
 };
 use futures_core::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::info;
 
@@ -36,6 +36,10 @@ use crate::{
         UpstreamAuthorization, UpstreamBodyStream, UpstreamChatRequest, UpstreamError,
         UpstreamResponsesRequest,
     },
+    runtime_settings::{
+        RuntimeSettingsHandle, RuntimeSettingsSnapshot, RuntimeSettingsUpdate,
+        RuntimeSettingsUpdateError,
+    },
     ui::{self, UiEventFilter},
 };
 
@@ -46,6 +50,7 @@ struct AppState {
     config: Arc<AppConfig>,
     event_log: EventLogHandle,
     openai_client: Arc<dyn OpenAiCompatibleClient>,
+    runtime_settings: Option<RuntimeSettingsHandle>,
 }
 
 pub fn build_router(config: AppConfig, event_log: EventLogHandle) -> Result<Router> {
@@ -53,15 +58,39 @@ pub fn build_router(config: AppConfig, event_log: EventLogHandle) -> Result<Rout
     Ok(build_router_with_client(config, event_log, openai_client))
 }
 
+pub fn build_router_with_runtime_settings(
+    config: AppConfig,
+    event_log: EventLogHandle,
+    runtime_settings: RuntimeSettingsHandle,
+) -> Result<Router> {
+    let openai_client = Arc::new(ReqwestOpenAiCompatibleClient::new(&config.openai.base_url)?);
+    Ok(build_router_with_client_and_runtime_settings(
+        config,
+        event_log,
+        openai_client,
+        Some(runtime_settings),
+    ))
+}
+
 fn build_router_with_client(
     config: AppConfig,
     event_log: EventLogHandle,
     openai_client: Arc<dyn OpenAiCompatibleClient>,
 ) -> Router {
+    build_router_with_client_and_runtime_settings(config, event_log, openai_client, None)
+}
+
+fn build_router_with_client_and_runtime_settings(
+    config: AppConfig,
+    event_log: EventLogHandle,
+    openai_client: Arc<dyn OpenAiCompatibleClient>,
+    runtime_settings: Option<RuntimeSettingsHandle>,
+) -> Router {
     let state = AppState {
         config: Arc::new(config),
         event_log,
         openai_client,
+        runtime_settings,
     };
 
     Router::new()
@@ -69,6 +98,8 @@ fn build_router_with_client(
         .route("/ui", get(ui_page))
         .route("/ui/events/recent", get(ui_recent_events))
         .route("/ui/events", get(ui_events))
+        .route("/ui/settings", get(ui_settings).put(update_ui_settings))
+        .route("/ui/settings/events", get(ui_settings_events))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .layer(middleware::from_fn_with_state(
@@ -76,6 +107,107 @@ fn build_router_with_client(
             request_logging_middleware,
         ))
         .with_state(state)
+}
+
+async fn ui_settings(State(state): State<AppState>) -> Response {
+    match state.runtime_settings.as_ref() {
+        Some(settings) => Json(settings.snapshot()).into_response(),
+        None => settings_unavailable_response(),
+    }
+}
+
+async fn update_ui_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateRuntimeSettingsRequest>,
+) -> Response {
+    if !has_same_origin(&headers) {
+        return settings_error_response(
+            StatusCode::FORBIDDEN,
+            "invalid_origin",
+            "runtime settings updates require a same-origin browser request",
+            state
+                .runtime_settings
+                .as_ref()
+                .map(|settings| settings.snapshot()),
+        );
+    }
+
+    let Some(settings) = state.runtime_settings.as_ref() else {
+        return settings_unavailable_response();
+    };
+    match settings
+        .update(
+            request.expected_revision,
+            RuntimeSettingsUpdate {
+                goblin_mode: request.goblin_mode,
+            },
+        )
+        .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(RuntimeSettingsUpdateError::Conflict { .. }) => settings_error_response(
+            StatusCode::CONFLICT,
+            "revision_conflict",
+            "runtime settings changed; retry using the authoritative revision",
+            Some(settings.snapshot()),
+        ),
+        Err(error) => settings_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.code(),
+            "runtime settings could not be saved",
+            Some(settings.snapshot()),
+        ),
+    }
+}
+
+async fn ui_settings_events(State(state): State<AppState>) -> Response {
+    match state.runtime_settings.as_ref() {
+        Some(settings) => ui::settings_stream(settings.subscribe()).into_response(),
+        None => settings_unavailable_response(),
+    }
+}
+
+fn has_same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    origin == format!("http://{host}") || origin == format!("https://{host}")
+}
+
+fn settings_unavailable_response() -> Response {
+    settings_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "settings_unavailable",
+        "runtime settings are not available",
+        None,
+    )
+}
+
+fn settings_error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    settings: Option<RuntimeSettingsSnapshot>,
+) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "code": code, "message": message },
+            "settings": settings,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateRuntimeSettingsRequest {
+    expected_revision: u64,
+    goblin_mode: bool,
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1373,6 +1505,114 @@ mod tests {
         assert!(html.contains("Marsala Interception"));
         assert!(html.contains("/ui/events/recent"));
         assert!(html.contains("new EventSource('/ui/events?'"));
+        assert!(html.contains("Goblin mode"));
+        assert!(html.contains("Dance baby, dance! Goblins are back on the menu!"));
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_api_updates_with_revision_and_same_origin() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let settings = RuntimeSettingsHandle::load(tempdir.path().join("settings.json"))
+            .await
+            .handle;
+        let app = build_router_with_client_and_runtime_settings(
+            AppConfig::default(),
+            EventLogHandle::disabled(),
+            Arc::new(StubClient::default()),
+            Some(settings.clone()),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/settings")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let snapshot: RuntimeSettingsSnapshot = serde_json::from_slice(&body).expect("settings");
+        assert_eq!(snapshot.revision, 0);
+        assert!(!snapshot.goblin_mode);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/ui/settings")
+                    .header(HOST, "marsala.test")
+                    .header(ORIGIN, "http://marsala.test")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"expected_revision":0,"goblin_mode":true}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(settings.snapshot().revision, 1);
+        assert!(settings.snapshot().goblin_mode);
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_api_rejects_cross_origin_and_returns_conflict_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let settings = RuntimeSettingsHandle::load(tempdir.path().join("settings.json"))
+            .await
+            .handle;
+        let app = build_router_with_client_and_runtime_settings(
+            AppConfig::default(),
+            EventLogHandle::disabled(),
+            Arc::new(StubClient::default()),
+            Some(settings.clone()),
+        );
+
+        let cross_origin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/ui/settings")
+                    .header(HOST, "marsala.test")
+                    .header(ORIGIN, "https://attacker.test")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"expected_revision":0,"goblin_mode":true}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+        assert_eq!(settings.snapshot().revision, 0);
+
+        settings
+            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .await
+            .expect("update settings");
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/ui/settings")
+                    .header(HOST, "marsala.test")
+                    .header(ORIGIN, "https://marsala.test")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"expected_revision":0,"goblin_mode":false}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(conflict.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"]["code"], "revision_conflict");
+        assert_eq!(json["settings"]["revision"], 1);
+        assert_eq!(json["settings"]["goblin_mode"], true);
     }
 
     #[tokio::test]
@@ -2145,6 +2385,7 @@ data: {"delta":"partial","secret":"chunk-secret"}
             config: Arc::new(config),
             event_log: EventLogHandle::disabled(),
             openai_client: Arc::new(StubClient::default()),
+            runtime_settings: None,
         };
         let request_id = "test-request".to_string();
 
