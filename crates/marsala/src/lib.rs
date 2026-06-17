@@ -8,6 +8,7 @@ pub mod openai;
 pub mod proxy;
 pub mod ui;
 
+pub(crate) mod codex_transform;
 #[allow(dead_code)]
 pub(crate) mod runtime_settings;
 
