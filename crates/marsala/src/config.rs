@@ -234,6 +234,7 @@ pub struct MitmConfig {
     pub allow_hosts: Vec<String>,
     pub ca_cert_path: PathBuf,
     pub ca_key_path: PathBuf,
+    pub max_request_body_bytes: usize,
 }
 
 impl Default for MitmConfig {
@@ -244,6 +245,7 @@ impl Default for MitmConfig {
             allow_hosts: Vec::new(),
             ca_cert_path: PathBuf::from("certs/marsala-ca.pem"),
             ca_key_path: PathBuf::from("certs/marsala-ca-key.pem"),
+            max_request_body_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -252,6 +254,9 @@ impl MitmConfig {
     fn validate(&self, proxy: &ProxyConfig) -> Result<()> {
         if self.default_action != "tunnel" {
             bail!("mitm.default_action currently supports only \"tunnel\"");
+        }
+        if self.max_request_body_bytes == 0 {
+            bail!("mitm.max_request_body_bytes must be greater than zero");
         }
 
         for host in &self.allow_hosts {
@@ -421,6 +426,7 @@ mod tests {
         assert_eq!(config.rewrite.streaming, "passthrough");
         assert!(!config.proxy.enabled);
         assert!(!config.mitm.enabled);
+        assert_eq!(config.mitm.max_request_body_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -445,6 +451,9 @@ capture_mitm_payloads = false
 capture_mitm_websocket_frames = false
 mitm_payload_preview_bytes = 123
 mitm_websocket_frame_preview_bytes = 456
+
+[mitm]
+max_request_body_bytes = 2048
 "#,
         )
         .expect("write config");
@@ -464,6 +473,7 @@ mitm_websocket_frame_preview_bytes = 456
         assert!(!config.logging.capture_mitm_websocket_frames);
         assert_eq!(config.logging.mitm_payload_preview_bytes, 123);
         assert_eq!(config.logging.mitm_websocket_frame_preview_bytes, 456);
+        assert_eq!(config.mitm.max_request_body_bytes, 2048);
     }
 
     #[test]
