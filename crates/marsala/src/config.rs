@@ -12,6 +12,7 @@ const MITM_ALLOW_HOSTS_ENV_KEY: &str = "mitm.allow_hosts";
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub server: ServerConfig,
+    pub runtime_settings: RuntimeSettingsConfig,
     pub openai: OpenAiConfig,
     pub logging: LoggingConfig,
     pub rewrite: RewriteConfig,
@@ -24,6 +25,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            runtime_settings: RuntimeSettingsConfig::default(),
             openai: OpenAiConfig::default(),
             logging: LoggingConfig::default(),
             rewrite: RewriteConfig::default(),
@@ -70,6 +72,7 @@ impl AppConfig {
     pub fn to_active_toml_string(&self) -> Result<String> {
         toml::to_string_pretty(&ActiveConfigView {
             server: &self.server,
+            runtime_settings: &self.runtime_settings,
             openai: &self.openai,
             logging: &self.logging,
             proxy: &self.proxy,
@@ -89,6 +92,7 @@ impl AppConfig {
 #[derive(Debug, Serialize)]
 struct ActiveConfigView<'a> {
     server: &'a ServerConfig,
+    runtime_settings: &'a RuntimeSettingsConfig,
     openai: &'a OpenAiConfig,
     logging: &'a LoggingConfig,
     proxy: &'a ProxyConfig,
@@ -99,6 +103,20 @@ struct ActiveConfigView<'a> {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeSettingsConfig {
+    pub path: PathBuf,
+}
+
+impl Default for RuntimeSettingsConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("state/runtime-settings.json"),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -412,6 +430,10 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8787);
+        assert_eq!(
+            config.runtime_settings.path,
+            PathBuf::from("state/runtime-settings.json")
+        );
         assert_eq!(config.openai.base_url, "https://api.openai.com/v1");
         assert_eq!(config.openai.auth_mode, OpenAiAuthMode::ConfiguredApiKey);
         assert!(config.logging.enabled);
@@ -452,6 +474,9 @@ capture_mitm_websocket_frames = false
 mitm_payload_preview_bytes = 123
 mitm_websocket_frame_preview_bytes = 456
 
+[runtime_settings]
+path = "custom/runtime-settings.json"
+
 [mitm]
 max_request_body_bytes = 2048
 "#,
@@ -466,6 +491,10 @@ max_request_body_bytes = 2048
 
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 9999);
+        assert_eq!(
+            config.runtime_settings.path,
+            PathBuf::from("custom/runtime-settings.json")
+        );
         assert_eq!(config.logging.path, PathBuf::from("custom/events.jsonl"));
         assert!(!config.logging.log_bodies);
         assert!(config.logging.redact_secrets);
@@ -754,6 +783,7 @@ server = "127.0.0.1:8787"
             .expect("render active config");
 
         assert!(rendered.contains("[server]"));
+        assert!(rendered.contains("[runtime_settings]"));
         assert!(rendered.contains("[openai]"));
         assert!(rendered.contains("[logging]"));
         assert!(rendered.contains("[proxy]"));
@@ -770,6 +800,7 @@ server = "127.0.0.1:8787"
             .expect("render full config");
 
         assert!(rendered.contains("[openai]"));
+        assert!(rendered.contains("[runtime_settings]"));
         assert!(rendered.contains("[rewrite]"));
         assert!(rendered.contains("[tool_capture]"));
         assert!(rendered.contains("[proxy]"));
