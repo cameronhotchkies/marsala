@@ -29,3 +29,4 @@ default_action = "tunnel"
 allow_hosts = []
 ca_cert_path = "certs/marsala-ca.pem"
 ca_key_path = "certs/marsala-ca-key.pem"
+max_request_body_bytes = 67108864

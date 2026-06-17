@@ -39,7 +39,6 @@ use crate::{
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_MITM_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MITM_REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MITM_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -398,6 +397,7 @@ async fn handle_mitm_connect(
                     &host,
                     port,
                     &http_request,
+                    &config.mitm,
                     &config.logging,
                     &event_log,
                     started,
@@ -947,6 +947,7 @@ async fn forward_mitm_http1_request<S>(
     host: &str,
     port: u16,
     request: &ProxyRequest,
+    mitm: &MitmConfig,
     logging: &LoggingConfig,
     event_log: &EventLogHandle,
     started: Instant,
@@ -1062,7 +1063,7 @@ where
             ));
         }
     };
-    if request_body_len > MAX_MITM_REQUEST_BODY_BYTES {
+    if request_body_len > mitm.max_request_body_bytes {
         write_mitm_http_error_response(
             downstream.get_mut(),
             413,
@@ -3652,6 +3653,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowlisted_connect_rejects_request_body_above_configured_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_request_body_limit(&tempdir, 4).await;
+
+        let mut tls =
+            connect_mitm_client_to_target(fixture.addr, "localhost:443", &fixture.ca_cert_path)
+                .await;
+        tls.write_all(b"POST /body HTTP/1.1\r\nhost: localhost\r\ncontent-length: 5\r\n\r\n")
+            .await
+            .expect("write http request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("413 Payload Too Large"));
+        assert!(response.contains("mitm_request_body_too_large"));
+
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+        let records = read_json_records(&log_path);
+        let request_event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_request")
+            .expect("mitm request event");
+        assert_eq!(request_event["data"]["status"], "request_body_too_large");
+        assert_eq!(
+            request_event["data"]["error"],
+            "request body exceeds MITM forwarding limit"
+        );
+    }
+
+    #[tokio::test]
     async fn allowlisted_connect_forwards_websocket_101_tunnel_and_logs_safely() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let fixture = spawn_allowlisted_mitm_proxy(&tempdir).await;
@@ -4278,6 +4310,26 @@ mod tests {
         tempdir: &tempfile::TempDir,
         logging: LoggingConfig,
     ) -> RunningMitmProxy {
+        spawn_allowlisted_mitm_proxy_with_options(tempdir, logging, None).await
+    }
+
+    async fn spawn_allowlisted_mitm_proxy_with_request_body_limit(
+        tempdir: &tempfile::TempDir,
+        max_request_body_bytes: usize,
+    ) -> RunningMitmProxy {
+        spawn_allowlisted_mitm_proxy_with_options(
+            tempdir,
+            LoggingConfig::default(),
+            Some(max_request_body_bytes),
+        )
+        .await
+    }
+
+    async fn spawn_allowlisted_mitm_proxy_with_options(
+        tempdir: &tempfile::TempDir,
+        logging: LoggingConfig,
+        max_request_body_bytes: Option<usize>,
+    ) -> RunningMitmProxy {
         let log_path = tempdir.path().join("events.jsonl");
         let writer = EventLogWriter::spawn(&log_path, true)
             .await
@@ -4292,6 +4344,9 @@ mod tests {
         config.mitm.allow_hosts = vec!["localhost".to_string()];
         config.mitm.ca_cert_path = tempdir.path().join("certs/marsala-ca.pem");
         config.mitm.ca_key_path = tempdir.path().join("certs/marsala-ca-key.pem");
+        if let Some(max_request_body_bytes) = max_request_body_bytes {
+            config.mitm.max_request_body_bytes = max_request_body_bytes;
+        }
         init_ca(&config.mitm).expect("init ca");
         let ca_cert_path = config.mitm.ca_cert_path.clone();
         let task = tokio::spawn(serve_listener(

@@ -121,10 +121,12 @@ default_action = "tunnel"
 allow_hosts = ["provider.example"]
 ca_cert_path = "certs/marsala-ca.pem"
 ca_key_path = "certs/marsala-ca-key.pem"
+max_request_body_bytes = 67108864
 ```
 
 `mitm.allow_hosts` accepts exact hostnames only. Wildcards, URLs, and hostnames
 with ports are rejected. Traffic to every other host remains tunneled.
+`mitm.max_request_body_bytes` bounds buffered MITM request forwarding.
 
 Generate a local CA without overwriting existing files:
 
