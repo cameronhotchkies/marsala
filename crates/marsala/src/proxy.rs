@@ -1,15 +1,18 @@
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     net::SocketAddr,
-    sync::{Arc, Once},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Once,
+    },
     time::Instant,
 };
 
 use anyhow::{Context, Result};
-use flate2::{Decompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -34,8 +37,13 @@ use tokio_rustls::{
 use tracing::{debug, info};
 
 use crate::{
+    codex_transform::{
+        transform_response_create, BoundedMatchCount, FailureReason, SkipReason, TransformAudit,
+        TransformStatus,
+    },
     config::{AppConfig, LoggingConfig, MitmConfig, MitmConnectAction},
     event_log::EventLogHandle,
+    runtime_settings::RuntimeSettingsHandle,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -51,6 +59,8 @@ const MITM_RESPONSE_BODY_COPY_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_WEBSOCKET_INSPECT_BUFFER_BYTES: usize = 1024 * 1024;
 const WEBSOCKET_DEFLATE_PREVIEW_SAFETY_BYTES: usize = 1024;
 const WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES: usize = 1024 * 1024;
+static WEBSOCKET_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static WEBSOCKET_CONNECTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub async fn serve(
     config: AppConfig,
@@ -81,6 +91,16 @@ pub(crate) async fn serve_listener(
     listener: TcpListener,
     config: AppConfig,
     event_log: EventLogHandle,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    serve_listener_with_runtime(listener, config, event_log, None, shutdown).await
+}
+
+pub(crate) async fn serve_listener_with_runtime(
+    listener: TcpListener,
+    config: AppConfig,
+    event_log: EventLogHandle,
+    runtime_settings: Option<RuntimeSettingsHandle>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
@@ -93,8 +113,15 @@ pub(crate) async fn serve_listener(
                 let (stream, peer_addr) = result.context("failed to accept proxy connection")?;
                 let connection_log = event_log.clone();
                 let connection_config = config.clone();
+                let connection_runtime_settings = runtime_settings.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, peer_addr, connection_config, connection_log).await {
+                    if let Err(error) = handle_connection(
+                        stream,
+                        peer_addr,
+                        connection_config,
+                        connection_log,
+                        connection_runtime_settings,
+                    ).await {
                         debug!(%error, %peer_addr, "proxy probe connection ended with error");
                     }
                 });
@@ -113,6 +140,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     config: AppConfig,
     event_log: EventLogHandle,
+    runtime_settings: Option<RuntimeSettingsHandle>,
 ) -> Result<()> {
     let started = Instant::now();
     let mut reader = BufReader::new(stream);
@@ -150,7 +178,16 @@ async fn handle_connection(
     };
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(reader, peer_addr, config, event_log, started, request).await
+        handle_connect(
+            reader,
+            peer_addr,
+            config,
+            event_log,
+            runtime_settings,
+            started,
+            request,
+        )
+        .await
     } else {
         handle_plain_http(reader, peer_addr, event_log, started, request).await
     }
@@ -161,6 +198,7 @@ async fn handle_connect(
     peer_addr: SocketAddr,
     config: AppConfig,
     event_log: EventLogHandle,
+    runtime_settings: Option<RuntimeSettingsHandle>,
     started: Instant,
     request: ProxyRequest,
 ) -> Result<()> {
@@ -191,7 +229,15 @@ async fn handle_connect(
 
     if connect_action == ConnectAction::Mitm {
         return handle_mitm_connect(
-            reader, peer_addr, config, event_log, started, request, host, port,
+            reader,
+            peer_addr,
+            config,
+            event_log,
+            runtime_settings,
+            started,
+            request,
+            host,
+            port,
         )
         .await;
     }
@@ -252,6 +298,7 @@ async fn handle_mitm_connect(
     peer_addr: SocketAddr,
     config: AppConfig,
     event_log: EventLogHandle,
+    runtime_settings: Option<RuntimeSettingsHandle>,
     started: Instant,
     request: ProxyRequest,
     host: String,
@@ -400,6 +447,7 @@ async fn handle_mitm_connect(
                     &config.mitm,
                     &config.logging,
                     &event_log,
+                    runtime_settings.as_ref(),
                     started,
                 )
                 .await
@@ -942,6 +990,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_mitm_http1_request<S>(
     downstream: &mut BufReader<S>,
     host: &str,
@@ -950,6 +999,7 @@ async fn forward_mitm_http1_request<S>(
     mitm: &MitmConfig,
     logging: &LoggingConfig,
     event_log: &EventLogHandle,
+    runtime_settings: Option<&RuntimeSettingsHandle>,
     started: Instant,
 ) -> Result<MitmForwardResult>
 where
@@ -1026,7 +1076,14 @@ where
         }
 
         return forward_mitm_websocket_upgrade(
-            downstream, host, port, request, logging, event_log, started,
+            downstream,
+            host,
+            port,
+            request,
+            logging,
+            event_log,
+            runtime_settings,
+            started,
         )
         .await;
     }
@@ -1248,6 +1305,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_mitm_websocket_upgrade<S>(
     downstream: &mut BufReader<S>,
     host: &str,
@@ -1255,6 +1313,7 @@ async fn forward_mitm_websocket_upgrade<S>(
     request: &ProxyRequest,
     logging: &LoggingConfig,
     event_log: &EventLogHandle,
+    runtime_settings: Option<&RuntimeSettingsHandle>,
     started: Instant,
 ) -> Result<MitmForwardResult>
 where
@@ -1340,8 +1399,14 @@ where
         .context("failed to forward buffered WebSocket upstream bytes downstream")?;
 
     let compression = WebSocketCompression::from_handshake(request, &response);
-    let tunnel_result = if logging.capture_mitm_websocket_frames {
-        copy_bidirectional_with_websocket_capture(
+    let transform_codex_requests = runtime_settings.is_some()
+        && request
+            .target
+            .split('?')
+            .next()
+            .is_some_and(|path| path == "/backend-api/codex/responses");
+    let tunnel_result = if logging.capture_mitm_websocket_frames || transform_codex_requests {
+        copy_bidirectional_with_websocket_processing(
             downstream.get_mut(),
             upstream_reader.get_mut(),
             WebSocketCaptureContext {
@@ -1352,7 +1417,10 @@ where
                 request,
                 preview_cap: logging.mitm_websocket_frame_preview_bytes,
                 compression,
+                capture_frames: logging.capture_mitm_websocket_frames,
             },
+            runtime_settings,
+            transform_codex_requests,
         )
         .await
     } else {
@@ -1713,11 +1781,13 @@ struct WebSocketCaptureContext<'a> {
     request: &'a ProxyRequest,
     preview_cap: usize,
     compression: WebSocketCompression,
+    capture_frames: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct WebSocketCompression {
     permessage_deflate: bool,
+    transform_supported: bool,
     client_no_context_takeover: bool,
     server_no_context_takeover: bool,
 }
@@ -1738,8 +1808,23 @@ impl WebSocketCompression {
             return Self::default();
         }
 
+        let transform_supported = accepted.params.iter().all(|(name, value)| {
+            if name.eq_ignore_ascii_case("client_no_context_takeover")
+                || name.eq_ignore_ascii_case("server_no_context_takeover")
+            {
+                return value.is_none();
+            }
+            if name.eq_ignore_ascii_case("client_max_window_bits")
+                || name.eq_ignore_ascii_case("server_max_window_bits")
+            {
+                return value.as_deref() == Some("15");
+            }
+            false
+        });
+
         Self {
             permessage_deflate: true,
+            transform_supported,
             client_no_context_takeover: accepted.has_param("client_no_context_takeover"),
             server_no_context_takeover: accepted.has_param("server_no_context_takeover"),
         }
@@ -1756,14 +1841,14 @@ impl WebSocketCompression {
 #[derive(Debug)]
 struct WebSocketExtension {
     name: String,
-    params: Vec<String>,
+    params: Vec<(String, Option<String>)>,
 }
 
 impl WebSocketExtension {
     fn has_param(&self, name: &str) -> bool {
         self.params
             .iter()
-            .any(|param| param.eq_ignore_ascii_case(name))
+            .any(|(param, _)| param.eq_ignore_ascii_case(name))
     }
 }
 
@@ -1780,9 +1865,14 @@ fn websocket_extensions(headers: &[(String, String)]) -> Vec<WebSocketExtension>
             }
             let params = parts
                 .filter_map(|part| {
-                    let name = part.split_once('=').map(|(name, _)| name).unwrap_or(part);
+                    let (name, value) = part
+                        .split_once('=')
+                        .map(|(name, value)| {
+                            (name, Some(value.trim().trim_matches('"').to_string()))
+                        })
+                        .unwrap_or((part, None));
                     let name = name.trim();
-                    (!name.is_empty()).then(|| name.to_string())
+                    (!name.is_empty()).then(|| (name.to_string(), value))
                 })
                 .collect();
             Some(WebSocketExtension { name, params })
@@ -1790,10 +1880,12 @@ fn websocket_extensions(headers: &[(String, String)]) -> Vec<WebSocketExtension>
         .collect()
 }
 
-async fn copy_bidirectional_with_websocket_capture<A, B>(
+async fn copy_bidirectional_with_websocket_processing<A, B>(
     downstream: &mut A,
     upstream: &mut B,
     context: WebSocketCaptureContext<'_>,
+    runtime_settings: Option<&RuntimeSettingsHandle>,
+    transform_codex_requests: bool,
 ) -> io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -1803,6 +1895,12 @@ where
         WebSocketFrameInspector::new(PayloadDirection::Request, context.compression);
     let mut upstream_to_downstream =
         WebSocketFrameInspector::new(PayloadDirection::Response, context.compression);
+    let mut request_processor = WebSocketRequestProcessor::new(context.compression);
+    let mut response_processor = WebSocketResponseProcessor::new(context.compression);
+    let mut correlation = WebSocketCorrelation::new(format!(
+        "ws-connection-{}",
+        WEBSOCKET_CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut downstream_buf = [0u8; 8192];
     let mut upstream_buf = [0u8; 8192];
     let mut client_to_server_bytes = 0u64;
@@ -1816,10 +1914,28 @@ where
                 let read = read?;
                 if read == 0 {
                     downstream_done = true;
+                    let pending = request_processor.finish();
+                    if !pending.is_empty() {
+                        upstream.write_all(&pending).await?;
+                    }
                     upstream.shutdown().await?;
                 } else {
-                    downstream_to_upstream.ingest(&downstream_buf[..read], &context);
-                    upstream.write_all(&downstream_buf[..read]).await?;
+                    if context.capture_frames {
+                        downstream_to_upstream.ingest(&downstream_buf[..read], &context);
+                    }
+                    if transform_codex_requests {
+                        let output = request_processor.ingest(
+                            &downstream_buf[..read],
+                            runtime_settings,
+                            &context,
+                            &mut correlation,
+                        );
+                        if !output.is_empty() {
+                            upstream.write_all(&output).await?;
+                        }
+                    } else {
+                        upstream.write_all(&downstream_buf[..read]).await?;
+                    }
                     client_to_server_bytes += read as u64;
                 }
             }
@@ -1829,7 +1945,16 @@ where
                     upstream_done = true;
                     downstream.shutdown().await?;
                 } else {
-                    upstream_to_downstream.ingest(&upstream_buf[..read], &context);
+                    if context.capture_frames {
+                        upstream_to_downstream.ingest(&upstream_buf[..read], &context);
+                    }
+                    if transform_codex_requests {
+                        response_processor.ingest(
+                            &upstream_buf[..read],
+                            &context,
+                            &mut correlation,
+                        );
+                    }
                     downstream.write_all(&upstream_buf[..read]).await?;
                     server_to_client_bytes += read as u64;
                 }
@@ -1838,6 +1963,905 @@ where
     }
 
     Ok((client_to_server_bytes, server_to_client_bytes))
+}
+
+struct WebSocketRequestProcessor {
+    parser: WebSocketFrameInspector,
+    pending: Option<PendingWebSocketMessage>,
+    compressor: Option<Compress>,
+    passthrough: bool,
+}
+
+struct PendingWebSocketMessage {
+    items: Vec<PendingWebSocketItem>,
+    kind: WebSocketMessageKind,
+    compressed: bool,
+    raw_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+enum WebSocketMessageKind {
+    Text,
+    Binary,
+}
+
+enum PendingWebSocketItem {
+    Data(WebSocketFrame),
+}
+
+impl WebSocketRequestProcessor {
+    fn new(compression: WebSocketCompression) -> Self {
+        Self {
+            parser: WebSocketFrameInspector::new(PayloadDirection::Request, compression),
+            pending: None,
+            compressor: None,
+            passthrough: false,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        bytes: &[u8],
+        runtime_settings: Option<&RuntimeSettingsHandle>,
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &mut WebSocketCorrelation,
+    ) -> Vec<u8> {
+        if self.passthrough {
+            return bytes.to_vec();
+        }
+
+        self.parser.buffer.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        while let Some(frame) = self.parser.try_pop_frame() {
+            self.handle_frame(frame, runtime_settings, context, correlation, &mut output);
+            let pending_bytes = self.pending.as_ref().map_or(0, |pending| pending.raw_bytes);
+            if pending_bytes > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
+                self.passthrough = true;
+            }
+            if self.passthrough {
+                output.extend_from_slice(&self.finish());
+                break;
+            }
+        }
+
+        if self.parser.buffer.len() > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
+            output.extend_from_slice(&self.finish());
+            self.passthrough = true;
+        }
+        output
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        let mut output = Vec::new();
+        if let Some(pending) = self.pending.take() {
+            append_original_message(&mut output, pending);
+        }
+        output.extend_from_slice(&self.parser.buffer);
+        self.parser.buffer.clear();
+        output
+    }
+
+    fn handle_frame(
+        &mut self,
+        frame: WebSocketFrame,
+        runtime_settings: Option<&RuntimeSettingsHandle>,
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &mut WebSocketCorrelation,
+        output: &mut Vec<u8>,
+    ) {
+        match frame.opcode {
+            WebSocketOpcode::Text if self.pending.is_none() => {
+                let fin = frame.fin;
+                let compressed = context.compression.permessage_deflate && frame.rsv1;
+                let pending = PendingWebSocketMessage {
+                    raw_bytes: frame.raw.len(),
+                    items: vec![PendingWebSocketItem::Data(frame)],
+                    kind: WebSocketMessageKind::Text,
+                    compressed,
+                };
+                if fin {
+                    self.complete_message(pending, runtime_settings, context, correlation, output);
+                } else {
+                    self.pending = Some(pending);
+                }
+            }
+            WebSocketOpcode::Continuation if self.pending.is_some() => {
+                let fin = frame.fin;
+                let pending = self.pending.as_mut().expect("pending message checked");
+                pending.raw_bytes = pending.raw_bytes.saturating_add(frame.raw.len());
+                pending.items.push(PendingWebSocketItem::Data(frame));
+                if fin {
+                    let pending = self.pending.take().expect("pending message checked");
+                    match pending.kind {
+                        WebSocketMessageKind::Text => self.complete_message(
+                            pending,
+                            runtime_settings,
+                            context,
+                            correlation,
+                            output,
+                        ),
+                        WebSocketMessageKind::Binary => {
+                            self.complete_binary_message(pending, context, correlation, output)
+                        }
+                    }
+                }
+            }
+            WebSocketOpcode::Close if self.pending.is_some() => {
+                if let Some(pending) = self.pending.take() {
+                    append_original_message(output, pending);
+                }
+                output.extend_from_slice(&frame.raw);
+                self.passthrough = true;
+            }
+            WebSocketOpcode::Ping | WebSocketOpcode::Pong if self.pending.is_some() => {
+                output.extend_from_slice(&frame.raw);
+            }
+            WebSocketOpcode::Binary if self.pending.is_none() => {
+                let fin = frame.fin;
+                let compressed = context.compression.permessage_deflate && frame.rsv1;
+                let pending = PendingWebSocketMessage {
+                    raw_bytes: frame.raw.len(),
+                    items: vec![PendingWebSocketItem::Data(frame)],
+                    kind: WebSocketMessageKind::Binary,
+                    compressed,
+                };
+                if fin {
+                    self.complete_binary_message(pending, context, correlation, output);
+                } else {
+                    self.pending = Some(pending);
+                }
+            }
+            WebSocketOpcode::Continuation if self.pending.is_none() => {
+                output.extend_from_slice(&frame.raw);
+            }
+            WebSocketOpcode::Close | WebSocketOpcode::Ping | WebSocketOpcode::Pong
+                if self.pending.is_none() =>
+            {
+                output.extend_from_slice(&frame.raw);
+            }
+            _ => {
+                if let Some(pending) = self.pending.take() {
+                    append_original_message(output, pending);
+                }
+                output.extend_from_slice(&frame.raw);
+                self.passthrough = true;
+            }
+        }
+    }
+
+    fn complete_message(
+        &mut self,
+        pending: PendingWebSocketMessage,
+        runtime_settings: Option<&RuntimeSettingsHandle>,
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &mut WebSocketCorrelation,
+        output: &mut Vec<u8>,
+    ) {
+        let payload = pending_payload(&pending);
+        if pending.compressed && !context.compression.transform_supported {
+            emit_websocket_transport_audit_event(
+                context,
+                &correlation.connection_id,
+                "transform_skipped",
+                "unsupported_permessage_deflate_parameters",
+                None,
+            );
+            append_original_message(output, pending);
+            self.passthrough = true;
+            return;
+        }
+        let decoded = if pending.compressed {
+            match self.decode_message_for_transform(&payload) {
+                Ok(decoded) => decoded,
+                Err(reason) => {
+                    emit_websocket_transport_audit_event(
+                        context,
+                        &correlation.connection_id,
+                        "transform_failed",
+                        reason.as_audit_reason(),
+                        None,
+                    );
+                    append_original_message(output, pending);
+                    self.passthrough = true;
+                    return;
+                }
+            }
+        } else {
+            payload
+        };
+
+        let is_response_create = serde_json::from_slice::<Value>(&decoded)
+            .ok()
+            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            == Some("response.create");
+        let snapshot = is_response_create
+            .then(|| runtime_settings.map(RuntimeSettingsHandle::snapshot))
+            .flatten();
+        let enabled = snapshot.is_some_and(|snapshot| snapshot.goblin_mode);
+        let result = transform_response_create(&decoded, enabled);
+
+        let forwarded_payload = if pending.compressed {
+            match self.compress_message(
+                &result.bytes,
+                context.compression.client_no_context_takeover,
+            ) {
+                Ok(compressed) => compressed,
+                Err(()) => {
+                    emit_websocket_transport_audit_event(
+                        context,
+                        &correlation.connection_id,
+                        "transform_failed",
+                        "deflate_reencode_failed",
+                        None,
+                    );
+                    append_original_message(output, pending);
+                    self.passthrough = true;
+                    return;
+                }
+            }
+        } else {
+            result.bytes.clone()
+        };
+
+        if is_response_create {
+            let request_id = format!(
+                "ws-{}",
+                WEBSOCKET_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            correlation.register_request(CorrelatedRequest {
+                request_id: request_id.clone(),
+                settings_revision: snapshot.map(|snapshot| snapshot.revision),
+                audit: result.audit,
+            });
+            emit_websocket_transform_event(
+                context,
+                &correlation.connection_id,
+                &request_id,
+                snapshot.map(|snapshot| snapshot.revision),
+                result.audit,
+            );
+        }
+
+        if pending.compressed || result.audit.status == TransformStatus::Applied {
+            append_rebuilt_message(output, pending, &forwarded_payload);
+        } else {
+            append_original_message(output, pending);
+        }
+    }
+
+    fn complete_binary_message(
+        &mut self,
+        pending: PendingWebSocketMessage,
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &WebSocketCorrelation,
+        output: &mut Vec<u8>,
+    ) {
+        if !pending.compressed {
+            append_original_message(output, pending);
+            return;
+        }
+        if !context.compression.transform_supported {
+            emit_websocket_transport_audit_event(
+                context,
+                &correlation.connection_id,
+                "transform_skipped",
+                "unsupported_permessage_deflate_parameters",
+                None,
+            );
+            append_original_message(output, pending);
+            self.passthrough = true;
+            return;
+        }
+        let payload = pending_payload(&pending);
+        let decoded = match self.decode_message_for_transform(&payload) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                emit_websocket_transport_audit_event(
+                    context,
+                    &correlation.connection_id,
+                    "transform_failed",
+                    "binary_deflate_decode_failed",
+                    None,
+                );
+                append_original_message(output, pending);
+                self.passthrough = true;
+                return;
+            }
+        };
+        match self.compress_message(&decoded, context.compression.client_no_context_takeover) {
+            Ok(compressed) => append_rebuilt_message(output, pending, &compressed),
+            Err(()) => {
+                emit_websocket_transport_audit_event(
+                    context,
+                    &correlation.connection_id,
+                    "transform_failed",
+                    "binary_deflate_reencode_failed",
+                    None,
+                );
+                append_original_message(output, pending);
+                self.passthrough = true;
+            }
+        }
+    }
+
+    fn decode_message_for_transform(
+        &mut self,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, TransformDecodeError> {
+        let decoded = self
+            .parser
+            .decode_permessage_deflate(payload, WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES)
+            .map_err(|_| TransformDecodeError::Deflate)?;
+        if decoded.truncated {
+            return Err(TransformDecodeError::InflatedMessageTooLarge);
+        }
+        Ok(decoded.bytes)
+    }
+
+    fn compress_message(
+        &mut self,
+        payload: &[u8],
+        no_context_takeover: bool,
+    ) -> std::result::Result<Vec<u8>, ()> {
+        if no_context_takeover || self.compressor.is_none() {
+            self.compressor = Some(Compress::new(Compression::fast(), false));
+        }
+        let compressor = self.compressor.as_mut().expect("compressor initialized");
+        let mut output = Vec::with_capacity(payload.len().saturating_add(64));
+        compressor
+            .compress_vec(payload, &mut output, FlushCompress::Sync)
+            .map_err(|_| ())?;
+        if output.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            output.truncate(output.len() - 4);
+        } else {
+            self.compressor = None;
+            return Err(());
+        }
+        if no_context_takeover {
+            self.compressor = None;
+        }
+        Ok(output)
+    }
+}
+
+fn pending_payload(message: &PendingWebSocketMessage) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for item in &message.items {
+        let PendingWebSocketItem::Data(frame) = item;
+        payload.extend_from_slice(&frame.payload);
+    }
+    payload
+}
+
+fn append_original_message(output: &mut Vec<u8>, message: PendingWebSocketMessage) {
+    for item in message.items {
+        let PendingWebSocketItem::Data(frame) = item;
+        output.extend_from_slice(&frame.raw);
+    }
+}
+
+fn append_rebuilt_message(output: &mut Vec<u8>, message: PendingWebSocketMessage, payload: &[u8]) {
+    let data_frames = message
+        .items
+        .iter()
+        .filter(|item| matches!(item, PendingWebSocketItem::Data(_)))
+        .count();
+    let mut data_index = 0usize;
+    let mut offset = 0usize;
+    for item in message.items {
+        match item {
+            PendingWebSocketItem::Data(frame) => {
+                data_index += 1;
+                let remaining = payload.len().saturating_sub(offset);
+                let chunk_len = if data_index == data_frames {
+                    remaining
+                } else {
+                    frame.payload.len().min(remaining)
+                };
+                output.extend_from_slice(&encode_websocket_frame(
+                    &frame,
+                    &payload[offset..offset + chunk_len],
+                ));
+                offset += chunk_len;
+            }
+        }
+    }
+}
+
+fn encode_websocket_frame(frame: &WebSocketFrame, payload: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(payload.len().saturating_add(14));
+    let first = (if frame.fin { 0x80 } else { 0 })
+        | (if frame.rsv1 { 0x40 } else { 0 })
+        | frame.opcode.as_byte();
+    encoded.push(first);
+    let mask_bit = if frame.mask.is_some() { 0x80 } else { 0 };
+    match payload.len() {
+        0..=125 => encoded.push(mask_bit | payload.len() as u8),
+        126..=65535 => {
+            encoded.push(mask_bit | 126);
+            encoded.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        _ => {
+            encoded.push(mask_bit | 127);
+            encoded.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+    }
+    if let Some(mask) = frame.mask {
+        encoded.extend_from_slice(&mask);
+        encoded.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % 4]),
+        );
+    } else {
+        encoded.extend_from_slice(payload);
+    }
+    encoded
+}
+
+#[derive(Clone)]
+struct CorrelatedRequest {
+    request_id: String,
+    settings_revision: Option<u64>,
+    audit: TransformAudit,
+}
+
+struct CorrelatedResponse {
+    provider_response_id: String,
+    request: CorrelatedRequest,
+}
+
+struct WebSocketCorrelation {
+    connection_id: String,
+    pending_requests: VecDeque<CorrelatedRequest>,
+    active_responses: VecDeque<CorrelatedResponse>,
+    seen_response_ids: HashSet<String>,
+}
+
+enum ResponseBindResult {
+    Bound(CorrelatedRequest),
+    Duplicate,
+    Unbound,
+    Ambiguous,
+}
+
+impl WebSocketCorrelation {
+    fn new(connection_id: String) -> Self {
+        Self {
+            connection_id,
+            pending_requests: VecDeque::new(),
+            active_responses: VecDeque::new(),
+            seen_response_ids: HashSet::new(),
+        }
+    }
+
+    fn register_request(&mut self, request: CorrelatedRequest) {
+        self.pending_requests.push_back(request);
+    }
+
+    fn bind_response(&mut self, provider_response_id: &str) -> ResponseBindResult {
+        if !self
+            .seen_response_ids
+            .insert(provider_response_id.to_string())
+        {
+            return ResponseBindResult::Duplicate;
+        }
+        if self.pending_requests.len() > 1 {
+            self.pending_requests.clear();
+            return ResponseBindResult::Ambiguous;
+        }
+        let Some(request) = self.pending_requests.pop_front() else {
+            return ResponseBindResult::Unbound;
+        };
+        self.active_responses.push_back(CorrelatedResponse {
+            provider_response_id: provider_response_id.to_string(),
+            request: request.clone(),
+        });
+        ResponseBindResult::Bound(request)
+    }
+
+    fn finish_response(&mut self, provider_response_id: &str) -> Option<CorrelatedRequest> {
+        let index = self
+            .active_responses
+            .iter()
+            .position(|response| response.provider_response_id == provider_response_id)?;
+        self.active_responses
+            .remove(index)
+            .map(|response| response.request)
+    }
+}
+
+enum TransformDecodeError {
+    Deflate,
+    InflatedMessageTooLarge,
+}
+
+impl TransformDecodeError {
+    fn as_audit_reason(&self) -> &'static str {
+        match self {
+            Self::Deflate => "deflate_decode_failed",
+            Self::InflatedMessageTooLarge => "inflated_message_too_large",
+        }
+    }
+}
+
+struct WebSocketResponseProcessor {
+    parser: WebSocketFrameInspector,
+    pending: Option<PendingWebSocketMessage>,
+    passthrough: bool,
+}
+
+impl WebSocketResponseProcessor {
+    fn new(compression: WebSocketCompression) -> Self {
+        Self {
+            parser: WebSocketFrameInspector::new(PayloadDirection::Response, compression),
+            pending: None,
+            passthrough: false,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        bytes: &[u8],
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &mut WebSocketCorrelation,
+    ) {
+        if self.passthrough {
+            return;
+        }
+        self.parser.buffer.extend_from_slice(bytes);
+        while let Some(frame) = self.parser.try_pop_frame() {
+            self.handle_frame(frame, context, correlation);
+            let pending_bytes = self.pending.as_ref().map_or(0, |pending| pending.raw_bytes);
+            if pending_bytes > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
+                self.pending = None;
+                self.passthrough = true;
+                break;
+            }
+        }
+        if self.parser.buffer.len() > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
+            self.parser.buffer.clear();
+            self.pending = None;
+            self.passthrough = true;
+        }
+    }
+
+    fn handle_frame(
+        &mut self,
+        frame: WebSocketFrame,
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &mut WebSocketCorrelation,
+    ) {
+        match frame.opcode {
+            WebSocketOpcode::Text if self.pending.is_none() => {
+                let fin = frame.fin;
+                let pending = PendingWebSocketMessage {
+                    raw_bytes: frame.raw.len(),
+                    compressed: context.compression.permessage_deflate && frame.rsv1,
+                    kind: WebSocketMessageKind::Text,
+                    items: vec![PendingWebSocketItem::Data(frame)],
+                };
+                if fin {
+                    self.complete_message(pending, context, correlation);
+                } else {
+                    self.pending = Some(pending);
+                }
+            }
+            WebSocketOpcode::Continuation if self.pending.is_some() => {
+                let fin = frame.fin;
+                let pending = self.pending.as_mut().expect("pending response checked");
+                pending.raw_bytes = pending.raw_bytes.saturating_add(frame.raw.len());
+                pending.items.push(PendingWebSocketItem::Data(frame));
+                if fin {
+                    let pending = self.pending.take().expect("pending response checked");
+                    match pending.kind {
+                        WebSocketMessageKind::Text => {
+                            self.complete_message(pending, context, correlation)
+                        }
+                        WebSocketMessageKind::Binary => self.advance_binary_message(pending),
+                    }
+                }
+            }
+            WebSocketOpcode::Close | WebSocketOpcode::Ping | WebSocketOpcode::Pong => {}
+            WebSocketOpcode::Binary if self.pending.is_none() => {
+                let fin = frame.fin;
+                let pending = PendingWebSocketMessage {
+                    raw_bytes: frame.raw.len(),
+                    compressed: context.compression.permessage_deflate && frame.rsv1,
+                    kind: WebSocketMessageKind::Binary,
+                    items: vec![PendingWebSocketItem::Data(frame)],
+                };
+                if fin {
+                    self.advance_binary_message(pending);
+                } else {
+                    self.pending = Some(pending);
+                }
+            }
+            _ => {
+                self.pending = None;
+                self.passthrough = true;
+            }
+        }
+    }
+
+    fn advance_binary_message(&mut self, pending: PendingWebSocketMessage) {
+        if !pending.compressed {
+            return;
+        }
+        let payload = pending_payload(&pending);
+        if self
+            .parser
+            .decode_permessage_deflate(&payload, WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES)
+            .is_err()
+        {
+            self.passthrough = true;
+        }
+    }
+
+    fn complete_message(
+        &mut self,
+        pending: PendingWebSocketMessage,
+        context: &WebSocketCaptureContext<'_>,
+        correlation: &mut WebSocketCorrelation,
+    ) {
+        let payload = pending_payload(&pending);
+        let decoded = if pending.compressed {
+            match self
+                .parser
+                .decode_permessage_deflate(&payload, WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES)
+            {
+                Ok(decoded) if !decoded.truncated => decoded.bytes,
+                _ => {
+                    self.passthrough = true;
+                    return;
+                }
+            }
+        } else {
+            payload
+        };
+        let Ok(message) = serde_json::from_slice::<Value>(&decoded) else {
+            return;
+        };
+        observe_codex_response_message(&message, context, correlation);
+    }
+}
+
+fn observe_codex_response_message(
+    message: &Value,
+    context: &WebSocketCaptureContext<'_>,
+    correlation: &mut WebSocketCorrelation,
+) {
+    let Some(event_type) = message.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(provider_response_id) = provider_response_id(message) else {
+        return;
+    };
+
+    if event_type == "response.created" {
+        match correlation.bind_response(provider_response_id) {
+            ResponseBindResult::Bound(request) => emit_websocket_response_lifecycle_event(
+                context,
+                &correlation.connection_id,
+                &request,
+                provider_response_id,
+                "started",
+                event_type,
+            ),
+            ResponseBindResult::Duplicate => emit_websocket_transport_audit_event(
+                context,
+                &correlation.connection_id,
+                "response_unbound",
+                "duplicate_provider_response_id",
+                Some(provider_response_id),
+            ),
+            ResponseBindResult::Unbound => emit_websocket_transport_audit_event(
+                context,
+                &correlation.connection_id,
+                "response_unbound",
+                "no_pending_request",
+                Some(provider_response_id),
+            ),
+            ResponseBindResult::Ambiguous => emit_websocket_transport_audit_event(
+                context,
+                &correlation.connection_id,
+                "response_unbound",
+                "ambiguous_pending_requests",
+                Some(provider_response_id),
+            ),
+        }
+        return;
+    }
+
+    if is_terminal_response_event(event_type) {
+        if let Some(request) = correlation.finish_response(provider_response_id) {
+            emit_websocket_response_lifecycle_event(
+                context,
+                &correlation.connection_id,
+                &request,
+                provider_response_id,
+                "terminal",
+                event_type,
+            );
+        } else {
+            emit_websocket_transport_audit_event(
+                context,
+                &correlation.connection_id,
+                "response_unbound",
+                "unknown_terminal_response_id",
+                Some(provider_response_id),
+            );
+        }
+    }
+}
+
+fn provider_response_id(message: &Value) -> Option<&str> {
+    message
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| message.get("response_id").and_then(Value::as_str))
+}
+
+fn is_terminal_response_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.completed" | "response.failed" | "response.cancelled" | "response.incomplete"
+    )
+}
+
+fn emit_websocket_response_lifecycle_event(
+    context: &WebSocketCaptureContext<'_>,
+    connection_id: &str,
+    request: &CorrelatedRequest,
+    provider_response_id: &str,
+    lifecycle: &str,
+    provider_event_type: &str,
+) {
+    let mut data = Map::new();
+    data.insert("event_schema_version".into(), 1.into());
+    data.insert("websocket_connection_id".into(), connection_id.into());
+    data.insert("request_id".into(), request.request_id.clone().into());
+    data.insert("provider_response_id".into(), provider_response_id.into());
+    data.insert("status".into(), lifecycle.into());
+    data.insert("provider_event_type".into(), provider_event_type.into());
+    data.insert("target_host".into(), context.target_host.into());
+    data.insert("target_port".into(), context.target_port.into());
+    data.insert(
+        "path".into(),
+        redact_path_query(&context.request.target).into(),
+    );
+    data.insert(
+        "goblin_mode_enabled".into(),
+        request.audit.goblin_mode_enabled.into(),
+    );
+    data.insert(
+        "goblin_mode_applied".into(),
+        (request.audit.status == TransformStatus::Applied).into(),
+    );
+    data.insert(
+        "goblin_mode_outcome".into(),
+        transform_status_name(request.audit.status).into(),
+    );
+    data.insert(
+        "goblin_mode_reason".into(),
+        transform_reason(request.audit.status).into(),
+    );
+    data.insert("goblin_rule_version".into(), 1.into());
+    if let Some(revision) = request.settings_revision {
+        data.insert("settings_revision".into(), revision.into());
+    }
+    context
+        .event_log
+        .emit("mitm_websocket_response_lifecycle", Value::Object(data));
+}
+
+fn emit_websocket_transform_event(
+    context: &WebSocketCaptureContext<'_>,
+    connection_id: &str,
+    request_id: &str,
+    settings_revision: Option<u64>,
+    audit: TransformAudit,
+) {
+    let mut data = Map::new();
+    data.insert("event_schema_version".into(), 1.into());
+    data.insert("websocket_connection_id".into(), connection_id.into());
+    data.insert("request_id".into(), request_id.into());
+    data.insert("target_host".into(), context.target_host.into());
+    data.insert("target_port".into(), context.target_port.into());
+    data.insert(
+        "path".into(),
+        redact_path_query(&context.request.target).into(),
+    );
+    data.insert(
+        "goblin_mode_enabled".into(),
+        audit.goblin_mode_enabled.into(),
+    );
+    data.insert(
+        "goblin_mode_applied".into(),
+        (audit.status == TransformStatus::Applied).into(),
+    );
+    data.insert(
+        "goblin_mode_outcome".into(),
+        transform_status_name(audit.status).into(),
+    );
+    data.insert(
+        "goblin_mode_reason".into(),
+        transform_reason(audit.status).into(),
+    );
+    data.insert("goblin_rule_version".into(), 1.into());
+    data.insert("status".into(), transform_status_name(audit.status).into());
+    data.insert("reason".into(), transform_reason(audit.status).into());
+    data.insert(
+        "target_matches".into(),
+        match_count_name(audit.target_matches).into(),
+    );
+    if let Some(revision) = settings_revision {
+        data.insert("settings_revision".into(), revision.into());
+    }
+    context
+        .event_log
+        .emit("mitm_websocket_transform", Value::Object(data));
+}
+
+fn emit_websocket_transport_audit_event(
+    context: &WebSocketCaptureContext<'_>,
+    connection_id: &str,
+    status: &str,
+    reason: &str,
+    provider_response_id: Option<&str>,
+) {
+    let mut data = Map::new();
+    data.insert("event_schema_version".into(), 1.into());
+    data.insert("websocket_connection_id".into(), connection_id.into());
+    data.insert("status".into(), status.into());
+    data.insert("reason".into(), reason.into());
+    data.insert("target_host".into(), context.target_host.into());
+    data.insert("target_port".into(), context.target_port.into());
+    data.insert(
+        "path".into(),
+        redact_path_query(&context.request.target).into(),
+    );
+    if let Some(provider_response_id) = provider_response_id {
+        data.insert("provider_response_id".into(), provider_response_id.into());
+    }
+    context
+        .event_log
+        .emit("mitm_websocket_transport_audit", Value::Object(data));
+}
+
+fn transform_status_name(status: TransformStatus) -> &'static str {
+    match status {
+        TransformStatus::Disabled => "disabled",
+        TransformStatus::Applied => "applied",
+        TransformStatus::Skipped(_) => "skipped",
+        TransformStatus::Failed(_) => "failed",
+    }
+}
+
+fn transform_reason(status: TransformStatus) -> &'static str {
+    match status {
+        TransformStatus::Disabled => "goblin_mode_disabled",
+        TransformStatus::Applied => "target_removed",
+        TransformStatus::Skipped(SkipReason::NotResponseCreate) => "not_response_create",
+        TransformStatus::Skipped(SkipReason::MissingInstructions) => "missing_instructions",
+        TransformStatus::Skipped(SkipReason::InstructionsNotString) => "instructions_not_string",
+        TransformStatus::Skipped(SkipReason::MatchCountNotTwo) => "match_count_not_two",
+        TransformStatus::Failed(FailureReason::MalformedJson) => "malformed_json",
+        TransformStatus::Failed(FailureReason::Serialization) => "serialization_failed",
+    }
+}
+
+fn match_count_name(count: BoundedMatchCount) -> &'static str {
+    match count {
+        BoundedMatchCount::NotInspected => "not_inspected",
+        BoundedMatchCount::Zero => "zero",
+        BoundedMatchCount::One => "one",
+        BoundedMatchCount::Two => "two",
+        BoundedMatchCount::ThreeOrMore => "three_or_more",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1873,6 +2897,18 @@ impl WebSocketOpcode {
             Self::Ping => "ping",
             Self::Pong => "pong",
             Self::Other => "other",
+        }
+    }
+
+    fn as_byte(self) -> u8 {
+        match self {
+            Self::Continuation => 0x0,
+            Self::Text => 0x1,
+            Self::Binary => 0x2,
+            Self::Close => 0x8,
+            Self::Ping => 0x9,
+            Self::Pong => 0xA,
+            Self::Other => 0xF,
         }
     }
 }
@@ -1963,6 +2999,7 @@ impl WebSocketFrameInspector {
             return None;
         }
 
+        let raw = self.buffer[..frame_len].to_vec();
         let mut payload = self.buffer[offset..frame_len].to_vec();
         if let Some(mask) = mask {
             for (index, byte) in payload.iter_mut().enumerate() {
@@ -1976,6 +3013,8 @@ impl WebSocketFrameInspector {
             rsv1,
             opcode,
             payload,
+            mask,
+            raw,
         })
     }
 
@@ -2194,6 +3233,8 @@ struct WebSocketFrame {
     rsv1: bool,
     opcode: WebSocketOpcode,
     payload: Vec<u8>,
+    mask: Option<[u8; 4]>,
+    raw: Vec<u8>,
 }
 
 struct WebSocketTextPreview {
@@ -3894,6 +4935,610 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goblin_mode_transforms_codex_request_without_frame_capture() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let original_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("before\n{target}\nmiddle\n{target}\nafter"),
+            "input": []
+        }))
+        .expect("request json");
+        let transformed = transform_response_create(&original_payload, true);
+        assert_eq!(transformed.audit.status, TransformStatus::Applied);
+        let original_frame =
+            websocket_frame(0x1, &original_payload, Some([0x11, 0x22, 0x33, 0x44]));
+        let expected_frame =
+            websocket_frame(0x1, &transformed.bytes, Some([0x11, 0x22, 0x33, 0x44]));
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(expected_frame, Vec::new()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let response_head = read_http_response_head(&mut tls).await;
+        assert!(response_head.contains("101 Switching Protocols"));
+        tls.write_all(&original_frame)
+            .await
+            .expect("write response.create frame");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+
+        let records = read_json_records(&log_path);
+        let event = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_websocket_transform")
+            .expect("transform event");
+        assert_eq!(event["data"]["status"], "applied");
+        assert_eq!(event["data"]["goblin_mode_enabled"], true);
+        assert_eq!(event["data"]["target_matches"], "two");
+        assert_eq!(event["data"]["settings_revision"], 1);
+        assert_eq!(event["data"]["event_schema_version"], 1);
+        assert!(event["data"]["request_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("ws-")));
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] != "mitm_websocket_frame"));
+    }
+
+    #[tokio::test]
+    async fn goblin_response_lifecycle_does_not_guess_when_requests_are_ambiguous() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let skipped_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("only one {target}")
+        }))
+        .expect("skipped request json");
+        let applied_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("first\n{target}\nsecond\n{target}")
+        }))
+        .expect("applied request json");
+        let transformed = transform_response_create(&applied_payload, true);
+        assert_eq!(transformed.audit.status, TransformStatus::Applied);
+
+        let client_frames = [
+            websocket_frame(0x1, &skipped_payload, Some([1, 2, 3, 4])),
+            websocket_frame(0x1, &transformed.bytes, Some([5, 6, 7, 8])),
+        ]
+        .concat();
+        let response_messages = [
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-a"}}),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-b"}}),
+            serde_json::json!({"type": "response.completed", "response": {"id": "resp-b"}}),
+            serde_json::json!({"type": "response.failed", "response": {"id": "resp-a"}}),
+        ];
+        let upstream_frames = response_messages
+            .iter()
+            .flat_map(|message| {
+                websocket_server_text_frame(
+                    &serde_json::to_string(message).expect("response event json"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(client_frames.clone(), upstream_frames.clone()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(
+            &[
+                websocket_frame(0x1, &skipped_payload, Some([1, 2, 3, 4])),
+                websocket_frame(0x1, &applied_payload, Some([5, 6, 7, 8])),
+            ]
+            .concat(),
+        )
+        .await
+        .expect("write sequential response.create messages");
+        let mut received = vec![0u8; upstream_frames.len()];
+        tls.read_exact(&mut received)
+            .await
+            .expect("read response lifecycle frames");
+        assert_eq!(received, upstream_frames);
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+
+        let records = read_json_records(&log_path);
+        let transforms = records
+            .iter()
+            .filter(|record| record["event_type"] == "mitm_websocket_transform")
+            .collect::<Vec<_>>();
+        assert_eq!(transforms.len(), 2);
+        assert_eq!(transforms[0]["data"]["goblin_mode_outcome"], "skipped");
+        assert_eq!(transforms[1]["data"]["goblin_mode_outcome"], "applied");
+
+        let lifecycle = records
+            .iter()
+            .filter(|record| record["event_type"] == "mitm_websocket_response_lifecycle")
+            .collect::<Vec<_>>();
+        assert!(lifecycle.is_empty());
+        let audits = records
+            .iter()
+            .filter(|record| record["event_type"] == "mitm_websocket_transport_audit")
+            .collect::<Vec<_>>();
+        assert_eq!(audits.len(), 4);
+        assert_eq!(audits[0]["data"]["reason"], "ambiguous_pending_requests");
+        assert_eq!(audits[1]["data"]["reason"], "no_pending_request");
+        assert!(audits[2..]
+            .iter()
+            .all(|event| event["data"]["reason"] == "unknown_terminal_response_id"));
+        assert!(audits
+            .iter()
+            .all(|event| event["data"]["event_schema_version"] == 1));
+        assert!(audits
+            .iter()
+            .all(|event| event["data"].get("request_id").is_none()));
+    }
+
+    #[tokio::test]
+    async fn goblin_mode_preserves_fragment_and_control_frame_order() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let original_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("one\n{target}\ntwo\n{target}\nthree")
+        }))
+        .expect("request json");
+        let transformed = transform_response_create(&original_payload, true).bytes;
+        let split = original_payload.len() / 2;
+        let first_mask = [0x10, 0x20, 0x30, 0x40];
+        let second_mask = [0x50, 0x60, 0x70, 0x80];
+        let first = websocket_frame_with_fin_flags(
+            0x1,
+            false,
+            false,
+            &original_payload[..split],
+            Some(first_mask),
+        );
+        let ping = websocket_frame(0x9, b"still-here", Some([1, 2, 3, 4]));
+        let second = websocket_frame_with_fin_flags(
+            0x0,
+            true,
+            false,
+            &original_payload[split..],
+            Some(second_mask),
+        );
+        let original_frames = [first.as_slice(), ping.as_slice(), second.as_slice()].concat();
+        let expected_split = split.min(transformed.len());
+        let expected_first = websocket_frame_with_fin_flags(
+            0x1,
+            false,
+            false,
+            &transformed[..expected_split],
+            Some(first_mask),
+        );
+        let expected_second = websocket_frame_with_fin_flags(
+            0x0,
+            true,
+            false,
+            &transformed[expected_split..],
+            Some(second_mask),
+        );
+        let expected_frames = [
+            ping.as_slice(),
+            expected_first.as_slice(),
+            expected_second.as_slice(),
+        ]
+        .concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(expected_frames, Vec::new()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&original_frames)
+            .await
+            .expect("write fragmented response.create");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goblin_mode_flushes_incomplete_fragment_before_close() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let original_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("one
+{target}
+two
+{target}
+three")
+        }))
+        .expect("request json");
+        let first = websocket_frame_with_fin_flags(
+            0x1,
+            false,
+            false,
+            &original_payload[..original_payload.len() / 2],
+            Some([0x10, 0x20, 0x30, 0x40]),
+        );
+        let close = websocket_frame(0x8, &[0x03, 0xe8], Some([1, 2, 3, 4]));
+        let original_frames = [first.as_slice(), close.as_slice()].concat();
+        let expected_frames = [first.as_slice(), close.as_slice()].concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(expected_frames, Vec::new()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1
+host: localhost:{}
+connection: Upgrade
+upgrade: websocket
+sec-websocket-key: test-key
+sec-websocket-version: 13
+
+",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&original_frames)
+            .await
+            .expect("write incomplete fragmented message and close");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goblin_mode_reencodes_with_permessage_deflate_context_takeover() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let first_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "session.update",
+            "instructions": "shared compression dictionary words"
+        }))
+        .expect("first json");
+        let second_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!(
+                "shared compression dictionary words\n{target}\nshared compression dictionary words\n{target}"
+            )
+        }))
+        .expect("second json");
+        let binary_payload = b"binary compression dictionary bridge";
+        let transformed = transform_response_create(&second_payload, true).bytes;
+
+        let mut client_compressor = Compress::new(Compression::fast(), false);
+        let first_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &first_payload);
+        let binary_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, binary_payload);
+        let second_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &second_payload);
+        let first_frame =
+            websocket_frame_with_rsv1(0x1, &first_compressed, Some([0x21, 0x32, 0x43, 0x54]));
+        let second_frame =
+            websocket_frame_with_rsv1(0x1, &second_compressed, Some([0x61, 0x72, 0x83, 0x94]));
+        let binary_frame =
+            websocket_frame_with_rsv1(0x2, &binary_compressed, Some([0x31, 0x42, 0x53, 0x64]));
+        let original_frames = [
+            first_frame.as_slice(),
+            binary_frame.as_slice(),
+            second_frame.as_slice(),
+        ]
+        .concat();
+
+        let mut upstream_compressor = Compress::new(Compression::fast(), false);
+        let _ =
+            permessage_deflate_payload_with_compressor(&mut upstream_compressor, &first_payload);
+        let expected_binary_compressed =
+            permessage_deflate_payload_with_compressor(&mut upstream_compressor, binary_payload);
+        let expected_binary = websocket_frame_with_rsv1(
+            0x2,
+            &expected_binary_compressed,
+            Some([0x31, 0x42, 0x53, 0x64]),
+        );
+        let transformed_compressed =
+            permessage_deflate_payload_with_compressor(&mut upstream_compressor, &transformed);
+        let expected_second =
+            websocket_frame_with_rsv1(0x1, &transformed_compressed, Some([0x61, 0x72, 0x83, 0x94]));
+        let expected_frames = [
+            first_frame.as_slice(),
+            expected_binary.as_slice(),
+            expected_second.as_slice(),
+        ]
+        .concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101_with_response_headers(
+                expected_frames,
+                Vec::new(),
+                "sec-websocket-extensions: permessage-deflate\r\n",
+            )
+            .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\nsec-websocket-extensions: permessage-deflate\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&original_frames)
+            .await
+            .expect("write compressed messages");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goblin_mode_reencodes_decoded_fail_open_payload_with_context_takeover() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let first_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("alpha
+{target}
+beta
+{target}
+gamma")
+        }))
+        .expect("first json");
+        let malformed_payload =
+            br#"{"type":"response.create","instructions":"unterminated"#.to_vec();
+        let second_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("delta
+{target}
+epsilon
+{target}
+zeta")
+        }))
+        .expect("second json");
+        let first_transformed = transform_response_create(&first_payload, true).bytes;
+        let second_transformed = transform_response_create(&second_payload, true).bytes;
+
+        let mut client_compressor = Compress::new(Compression::fast(), false);
+        let first_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &first_payload);
+        let malformed_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &malformed_payload);
+        let second_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &second_payload);
+        let first_frame =
+            websocket_frame_with_rsv1(0x1, &first_compressed, Some([0x21, 0x32, 0x43, 0x54]));
+        let malformed_frame =
+            websocket_frame_with_rsv1(0x1, &malformed_compressed, Some([0x31, 0x42, 0x53, 0x64]));
+        let second_frame =
+            websocket_frame_with_rsv1(0x1, &second_compressed, Some([0x61, 0x72, 0x83, 0x94]));
+        let original_frames = [
+            first_frame.as_slice(),
+            malformed_frame.as_slice(),
+            second_frame.as_slice(),
+        ]
+        .concat();
+
+        let mut upstream_compressor = Compress::new(Compression::fast(), false);
+        let expected_first_compressed = permessage_deflate_payload_with_compressor(
+            &mut upstream_compressor,
+            &first_transformed,
+        );
+        let expected_malformed_compressed = permessage_deflate_payload_with_compressor(
+            &mut upstream_compressor,
+            &malformed_payload,
+        );
+        let expected_second_compressed = permessage_deflate_payload_with_compressor(
+            &mut upstream_compressor,
+            &second_transformed,
+        );
+        let expected_first = websocket_frame_with_rsv1(
+            0x1,
+            &expected_first_compressed,
+            Some([0x21, 0x32, 0x43, 0x54]),
+        );
+        let expected_malformed = websocket_frame_with_rsv1(
+            0x1,
+            &expected_malformed_compressed,
+            Some([0x31, 0x42, 0x53, 0x64]),
+        );
+        let expected_second = websocket_frame_with_rsv1(
+            0x1,
+            &expected_second_compressed,
+            Some([0x61, 0x72, 0x83, 0x94]),
+        );
+        let expected_frames = [
+            expected_first.as_slice(),
+            expected_malformed.as_slice(),
+            expected_second.as_slice(),
+        ]
+        .concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101_with_response_headers(
+                expected_frames,
+                Vec::new(),
+                "sec-websocket-extensions: permessage-deflate
+",
+            )
+            .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1
+host: localhost:{}
+connection: Upgrade
+upgrade: websocket
+sec-websocket-key: test-key
+sec-websocket-version: 13
+sec-websocket-extensions: permessage-deflate
+
+",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&original_frames)
+            .await
+            .expect("write compressed messages");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn websocket_compression_rejects_unsupported_negotiated_parameters_for_transforms() {
+        let request = ProxyRequest {
+            method: "GET".into(),
+            target: "/backend-api/codex/responses".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![(
+                "sec-websocket-extensions".into(),
+                "permessage-deflate; client_max_window_bits".into(),
+            )],
+            header_bytes: 0,
+        };
+        let response = HttpResponse {
+            version: "HTTP/1.1".into(),
+            status_code: 101,
+            reason: "Switching Protocols".into(),
+            headers: vec![(
+                "sec-websocket-extensions".into(),
+                "permessage-deflate; client_max_window_bits=12".into(),
+            )],
+            header_bytes: 0,
+        };
+
+        let compression = WebSocketCompression::from_handshake(&request, &response);
+        assert!(compression.permessage_deflate);
+        assert!(!compression.transform_supported);
+    }
+
+    #[test]
+    fn websocket_correlation_reports_duplicate_and_ambiguous_response_ids() {
+        let audit = transform_response_create(b"{}", false).audit;
+        let request = |request_id: &str| CorrelatedRequest {
+            request_id: request_id.into(),
+            settings_revision: Some(1),
+            audit,
+        };
+        let mut correlation = WebSocketCorrelation::new("connection-test".into());
+        correlation.register_request(request("request-a"));
+        assert!(matches!(
+            correlation.bind_response("response-a"),
+            ResponseBindResult::Bound(_)
+        ));
+        assert!(matches!(
+            correlation.bind_response("response-a"),
+            ResponseBindResult::Duplicate
+        ));
+
+        correlation.register_request(request("request-b"));
+        correlation.register_request(request("request-c"));
+        assert!(matches!(
+            correlation.bind_response("response-b"),
+            ResponseBindResult::Ambiguous
+        ));
+        assert!(correlation.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goblin_mode_emits_versioned_audit_when_deflate_decode_fails() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let invalid_frame = websocket_frame_with_rsv1(0x1, &[0xff, 0xff, 0xff], Some([9, 8, 7, 6]));
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101_with_response_headers(
+                invalid_frame.clone(),
+                Vec::new(),
+                "sec-websocket-extensions: permessage-deflate\r\n",
+            )
+            .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\nsec-websocket-extensions: permessage-deflate\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&invalid_frame)
+            .await
+            .expect("write invalid compressed frame");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        let log_path = fixture.log_path.clone();
+        fixture.shutdown().await;
+
+        let records = read_json_records(&log_path);
+        let audit = records
+            .iter()
+            .find(|record| record["event_type"] == "mitm_websocket_transport_audit")
+            .expect("transport audit");
+        assert_eq!(audit["data"]["event_schema_version"], 1);
+        assert_eq!(audit["data"]["status"], "transform_failed");
+        assert_eq!(audit["data"]["reason"], "deflate_decode_failed");
+        assert!(audit["data"].get("request_id").is_none());
+    }
+
+    #[tokio::test]
     async fn mitm_websocket_capture_decodes_permessage_deflate_text_preview_without_rewriting_frame(
     ) {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -4310,7 +5955,7 @@ mod tests {
         tempdir: &tempfile::TempDir,
         logging: LoggingConfig,
     ) -> RunningMitmProxy {
-        spawn_allowlisted_mitm_proxy_with_options(tempdir, logging, None).await
+        spawn_allowlisted_mitm_proxy_with_options(tempdir, logging, None, None).await
     }
 
     async fn spawn_allowlisted_mitm_proxy_with_request_body_limit(
@@ -4321,6 +5966,28 @@ mod tests {
             tempdir,
             LoggingConfig::default(),
             Some(max_request_body_bytes),
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_allowlisted_mitm_proxy_with_goblin_mode(
+        tempdir: &tempfile::TempDir,
+    ) -> RunningMitmProxy {
+        let load = RuntimeSettingsHandle::load(tempdir.path().join("runtime-settings.json")).await;
+        let runtime_settings = load.handle;
+        runtime_settings
+            .update(
+                0,
+                crate::runtime_settings::RuntimeSettingsUpdate { goblin_mode: true },
+            )
+            .await
+            .expect("enable goblin mode");
+        spawn_allowlisted_mitm_proxy_with_options(
+            tempdir,
+            LoggingConfig::default(),
+            None,
+            Some(runtime_settings),
         )
         .await
     }
@@ -4329,6 +5996,7 @@ mod tests {
         tempdir: &tempfile::TempDir,
         logging: LoggingConfig,
         max_request_body_bytes: Option<usize>,
+        runtime_settings: Option<RuntimeSettingsHandle>,
     ) -> RunningMitmProxy {
         let log_path = tempdir.path().join("events.jsonl");
         let writer = EventLogWriter::spawn(&log_path, true)
@@ -4349,10 +6017,11 @@ mod tests {
         }
         init_ca(&config.mitm).expect("init ca");
         let ca_cert_path = config.mitm.ca_cert_path.clone();
-        let task = tokio::spawn(serve_listener(
+        let task = tokio::spawn(serve_listener_with_runtime(
             listener,
             config,
             writer.handle(),
+            runtime_settings,
             shutdown_rx,
         ));
 
@@ -4713,11 +6382,32 @@ mod tests {
         payload: &[u8],
         mask: Option<[u8; 4]>,
     ) -> Vec<u8> {
-        assert!(payload.len() < 126, "test helper supports small frames");
-        let mut frame = Vec::with_capacity(2 + mask.map(|_| 4).unwrap_or(0) + payload.len());
+        websocket_frame_with_fin_flags(opcode, true, rsv1, payload, mask)
+    }
+
+    fn websocket_frame_with_fin_flags(
+        opcode: u8,
+        fin: bool,
+        rsv1: bool,
+        payload: &[u8],
+        mask: Option<[u8; 4]>,
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(14 + payload.len());
+        let fin_bit = if fin { 0x80 } else { 0x00 };
         let rsv1_bit = if rsv1 { 0x40 } else { 0x00 };
-        frame.push(0x80 | rsv1_bit | opcode);
-        frame.push(payload.len() as u8 | mask.map(|_| 0x80).unwrap_or(0));
+        frame.push(fin_bit | rsv1_bit | opcode);
+        let mask_bit = mask.map(|_| 0x80).unwrap_or(0);
+        match payload.len() {
+            0..=125 => frame.push(payload.len() as u8 | mask_bit),
+            126..=65535 => {
+                frame.push(126 | mask_bit);
+                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            }
+            _ => {
+                frame.push(127 | mask_bit);
+                frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            }
+        }
         if let Some(mask) = mask {
             frame.extend_from_slice(&mask);
             for (index, byte) in payload.iter().enumerate() {
