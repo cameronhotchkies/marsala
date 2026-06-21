@@ -2017,8 +2017,6 @@ impl WebSocketRequestProcessor {
             let pending_bytes = self.pending.as_ref().map_or(0, |pending| pending.raw_bytes);
             if pending_bytes > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
                 self.passthrough = true;
-                output.extend_from_slice(&self.finish());
-                break;
             }
             if self.passthrough {
                 output.extend_from_slice(&self.finish());
@@ -2153,20 +2151,14 @@ impl WebSocketRequestProcessor {
             return;
         }
         let decoded = if pending.compressed {
-            match self
-                .parser
-                .decode_permessage_deflate(&payload, WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES)
-            {
-                Ok(decoded) if !decoded.truncated => decoded.bytes,
-                result => {
+            match self.decode_message_for_transform(&payload) {
+                Ok(decoded) => decoded,
+                Err(reason) => {
                     emit_websocket_transport_audit_event(
                         context,
                         &correlation.connection_id,
                         "transform_failed",
-                        match result {
-                            Ok(_) => "inflated_message_too_large",
-                            Err(_) => "deflate_decode_failed",
-                        },
+                        reason.as_audit_reason(),
                         None,
                     );
                     append_original_message(output, pending);
@@ -2245,6 +2237,10 @@ impl WebSocketRequestProcessor {
         correlation: &WebSocketCorrelation,
         output: &mut Vec<u8>,
     ) {
+        if !pending.compressed {
+            append_original_message(output, pending);
+            return;
+        }
         if !context.compression.transform_supported {
             emit_websocket_transport_audit_event(
                 context,
@@ -2258,12 +2254,9 @@ impl WebSocketRequestProcessor {
             return;
         }
         let payload = pending_payload(&pending);
-        let decoded = match self
-            .parser
-            .decode_permessage_deflate(&payload, WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES)
-        {
-            Ok(decoded) if !decoded.truncated => decoded.bytes,
-            _ => {
+        let decoded = match self.decode_message_for_transform(&payload) {
+            Ok(decoded) => decoded,
+            Err(_) => {
                 emit_websocket_transport_audit_event(
                     context,
                     &correlation.connection_id,
@@ -2290,6 +2283,20 @@ impl WebSocketRequestProcessor {
                 self.passthrough = true;
             }
         }
+    }
+
+    fn decode_message_for_transform(
+        &mut self,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, TransformDecodeError> {
+        let decoded = self
+            .parser
+            .decode_permessage_deflate(payload, WEBSOCKET_DEFLATE_MAX_INFLATED_BYTES)
+            .map_err(|_| TransformDecodeError::Deflate)?;
+        if decoded.truncated {
+            return Err(TransformDecodeError::InflatedMessageTooLarge);
+        }
+        Ok(decoded.bytes)
     }
 
     fn compress_message(
@@ -2463,6 +2470,20 @@ impl WebSocketCorrelation {
         self.active_responses
             .remove(index)
             .map(|response| response.request)
+    }
+}
+
+enum TransformDecodeError {
+    Deflate,
+    InflatedMessageTooLarge,
+}
+
+impl TransformDecodeError {
+    fn as_audit_reason(&self) -> &'static str {
+        match self {
+            Self::Deflate => "deflate_decode_failed",
+            Self::InflatedMessageTooLarge => "inflated_message_too_large",
+        }
     }
 }
 
