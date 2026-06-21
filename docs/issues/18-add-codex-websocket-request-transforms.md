@@ -40,7 +40,7 @@ request fields. The sanitized fixture from issue #1 must preserve that shape.
   `$.instructions` string. Tool definitions and all other fields remain outside
   the transform surface.
 - Add shared runtime transform state that can be read by the proxy and changed
-  through a narrow authenticated-by-origin UI endpoint without restarting the
+  through a narrow UI endpoint that validates Origin against Host without restarting the
   service. A change applies to subsequent complete client messages, including
   messages on already-open WebSocket connections; it does not alter a message
   already being processed.
@@ -102,7 +102,7 @@ request fields. The sanitized fixture from issue #1 must preserve that shape.
   using browser-local storage; stale writes cannot silently overwrite a newer
   value.
 - [ ] The settings endpoint reports the authoritative state, rejects malformed
-  or cross-origin changes, and never exposes prompt contents.
+  or Origin/Host-mismatched changes, and never exposes prompt contents.
 - [ ] Every supported request gets one request-time state snapshot and one local
   request ID. Toggling during a stream affects only the next request.
 - [ ] Response lifecycle events retain the same request ID, provider response

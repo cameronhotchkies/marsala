@@ -9,7 +9,6 @@ pub mod proxy;
 pub mod ui;
 
 pub(crate) mod codex_transform;
-#[allow(dead_code)]
 pub(crate) mod runtime_settings;
 
 use std::{future::IntoFuture, sync::Once, time::Duration};
@@ -22,6 +21,7 @@ use cli::{
 };
 use config::AppConfig;
 use event_log::EventLogWriter;
+use runtime_settings::RuntimeSettingsHandle;
 use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -122,6 +122,17 @@ fn init_tracing() {
 }
 
 async fn serve_command(config: AppConfig) -> Result<()> {
+    let runtime_settings_load = RuntimeSettingsHandle::load(&config.runtime_settings.path).await;
+    let runtime_settings_issue = runtime_settings_load.issue;
+    if let Some(issue) = runtime_settings_issue {
+        warn!(
+            issue = issue.code(),
+            path = %config.runtime_settings.path.display(),
+            "runtime settings could not be restored; using fail-safe defaults"
+        );
+    }
+    let runtime_settings = runtime_settings_load.handle;
+
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -142,6 +153,17 @@ async fn serve_command(config: AppConfig) -> Result<()> {
     let mut event_writer =
         EventLogWriter::spawn(&config.logging.path, config.logging.enabled).await?;
     let event_log = event_writer.handle();
+
+    if let Some(issue) = runtime_settings_issue {
+        event_log.emit(
+            "runtime_settings_load_problem",
+            serde_json::json!({
+                "issue": issue.code(),
+                "action": "using_fail_safe_defaults",
+                "goblin_mode_enabled": false,
+            }),
+        );
+    }
 
     event_log.emit(
         "service_started",
@@ -164,17 +186,22 @@ async fn serve_command(config: AppConfig) -> Result<()> {
             }),
         );
         info!(address = %proxy_local_addr, "marsala proxy probe listening");
-        Some(tokio::spawn(proxy::serve_listener(
+        Some(tokio::spawn(proxy::serve_listener_with_runtime(
             proxy_listener,
             config.clone(),
             event_log.clone(),
+            Some(runtime_settings.clone()),
             shutdown_rx.clone(),
         )))
     } else {
         None
     };
 
-    let app = http::build_router(config.clone(), event_log.clone())?;
+    let app = http::build_router_with_runtime_settings(
+        config.clone(),
+        event_log.clone(),
+        runtime_settings,
+    )?;
     info!(address = %local_addr, "marsala listening");
 
     let shutdown_log = event_log.clone();

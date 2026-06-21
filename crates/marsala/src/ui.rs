@@ -5,8 +5,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::watch;
 
-use crate::event_log::{read_tail_lines, EventLogFollowEvent, EventLogFollower, EventRecord};
+use crate::{
+    event_log::{read_tail_lines, EventLogFollowEvent, EventLogFollower, EventRecord},
+    runtime_settings::RuntimeSettingsSnapshot,
+};
 
 const DEFAULT_RECENT_LINES: usize = 200;
 const MAX_RECENT_LINES: usize = 2_000;
@@ -95,7 +99,7 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       padding: 10px 18px;
       border-bottom: 1px solid var(--line);
       display: grid;
-      grid-template-columns: 150px minmax(120px, 1fr) minmax(120px, 1fr) auto auto auto;
+      grid-template-columns: 150px minmax(120px, 1fr) minmax(120px, 1fr) auto auto auto auto;
       gap: 10px;
       align-items: end;
     }
@@ -241,7 +245,7 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
   <div class="app">
     <header>
       <h1>Marsala Interception</h1>
-      <div id="status" class="status">connecting</div>
+      <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true">connecting</div>
     </header>
     <section class="toolbar" aria-label="Filters">
       <label>Category
@@ -261,6 +265,7 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
         <input id="path" type="search" placeholder="/backend-api/">
       </label>
       <label class="toggle"><input id="payloadOnly" type="checkbox">Payload only</label>
+      <label class="toggle"><input id="goblinMode" type="checkbox" aria-label="Goblin mode" disabled><span aria-hidden="true">👺</span><span>Goblin mode</span></label>
       <button id="pause">Pause</button>
       <button id="clear">Clear</button>
     </section>
@@ -288,6 +293,10 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
           <h3>Preview</h3>
           <pre id="preview"></pre>
         </div>
+        <div id="goblinSection" class="section" hidden>
+          <h3>Goblin mode</h3>
+          <pre id="goblinDetails"></pre>
+        </div>
         <div class="section">
           <h3>Raw event</h3>
           <pre id="raw">{}</pre>
@@ -296,7 +305,10 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
     </main>
   </div>
   <script>
-    const state = { events: [], selected: null, source: null, paused: false, nextId: 1 };
+    const state = {
+      events: [], selected: null, source: null, paused: false, nextId: 1,
+      settings: null, settingsSource: null, settingsSaving: false
+    };
     const rows = document.getElementById('rows');
     const empty = document.getElementById('empty');
     const statusEl = document.getElementById('status');
@@ -305,6 +317,7 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       host: document.getElementById('host'),
       path: document.getElementById('path'),
       payloadOnly: document.getElementById('payloadOnly'),
+      goblinMode: document.getElementById('goblinMode'),
       pause: document.getElementById('pause'),
       clear: document.getElementById('clear')
     };
@@ -321,6 +334,63 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
 
     function setStatus(text) {
       statusEl.textContent = text + ' · visible ' + state.events.length;
+    }
+
+    function setExactStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function applySettings(settings) {
+      if (!settings || typeof settings.revision !== 'number' || typeof settings.goblin_mode !== 'boolean') return;
+      state.settings = settings;
+      controls.goblinMode.checked = settings.goblin_mode;
+      controls.goblinMode.disabled = state.settingsSaving;
+    }
+
+    async function loadSettings() {
+      controls.goblinMode.disabled = true;
+      const response = await fetch('/ui/settings', { cache: 'no-store' });
+      if (!response.ok) throw new Error('Goblin mode settings are unavailable');
+      applySettings(await response.json());
+    }
+
+    function connectSettings() {
+      if (state.settingsSource) state.settingsSource.close();
+      const source = new EventSource('/ui/settings/events');
+      state.settingsSource = source;
+      source.addEventListener('settings', message => applySettings(JSON.parse(message.data)));
+      source.addEventListener('error', () => {
+        if (!state.settings) controls.goblinMode.disabled = true;
+      });
+    }
+
+    async function saveGoblinMode(enabled) {
+      if (!state.settings || state.settingsSaving) return;
+      const previous = state.settings;
+      state.settingsSaving = true;
+      controls.goblinMode.disabled = true;
+      controls.goblinMode.checked = enabled;
+      try {
+        const response = await fetch('/ui/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ expected_revision: previous.revision, goblin_mode: enabled })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          if (body.settings) applySettings(body.settings);
+          throw new Error(body.error && body.error.message ? body.error.message : 'Goblin mode could not be saved');
+        }
+        applySettings(body);
+        if (enabled) setExactStatus('Dance baby, dance! Goblins are back on the menu!');
+        else setExactStatus('Goblin mode disabled.');
+      } catch (error) {
+        if (!state.settings || state.settings.revision === previous.revision) applySettings(previous);
+        setExactStatus('Goblin mode update failed: ' + error.message);
+      } finally {
+        state.settingsSaving = false;
+        controls.goblinMode.disabled = !state.settings;
+      }
     }
 
     function connect() {
@@ -392,7 +462,7 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       const meta = document.getElementById('detailMeta');
       meta.innerHTML = '';
       if (event) {
-        for (const value of [event.category, event.target_host, event.method, event.direction, statusText(event), event.byte_summary, event.auth_summary, event.preview_status, event.truncated ? 'truncated' : '']) {
+        for (const value of [event.category, event.target_host, event.method, event.direction, statusText(event), goblinMarker(event), event.byte_summary, event.auth_summary, event.preview_status, event.truncated ? 'truncated' : '']) {
           if (!value) continue;
           const span = document.createElement('span');
           span.className = 'pill';
@@ -412,6 +482,24 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
         previewSection.hidden = true;
         preview.textContent = '';
       }
+      const goblinSection = document.getElementById('goblinSection');
+      const goblinDetails = document.getElementById('goblinDetails');
+      if (event && hasGoblinAudit(event)) {
+        const values = [
+          ['enabled at request time', event.goblin_mode_enabled],
+          ['applied', event.goblin_mode_applied],
+          ['outcome', event.goblin_mode_outcome],
+          ['reason', event.goblin_mode_reason],
+          ['rule version', event.goblin_rule_version],
+          ['local request ID', event.request_id],
+          ['provider response ID', event.provider_response_id]
+        ].filter(([, value]) => value !== null && value !== undefined && value !== '');
+        goblinSection.hidden = false;
+        goblinDetails.textContent = values.map(([label, value]) => label + ': ' + value).join('\n');
+      } else {
+        goblinSection.hidden = true;
+        goblinDetails.textContent = '';
+      }
       document.getElementById('raw').textContent = event ? JSON.stringify(event.raw, null, 2) : '{}';
     }
 
@@ -426,7 +514,21 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       if (event.status) parts.push(String(event.status));
       if (event.upstream_status) parts.push('up ' + event.upstream_status);
       if (event.truncated) parts.push('truncated');
+      const goblin = goblinMarker(event);
+      if (goblin) parts.push(goblin);
       return parts.join(' · ');
+    }
+
+    function hasGoblinAudit(event) {
+      return event.goblin_mode_enabled !== null && event.goblin_mode_enabled !== undefined
+        || event.goblin_mode_applied !== null && event.goblin_mode_applied !== undefined
+        || Boolean(event.goblin_mode_outcome);
+    }
+
+    function goblinMarker(event) {
+      if (event.goblin_mode_applied === true) return 'Goblin applied';
+      if (event.goblin_mode_enabled === true) return 'Goblin on';
+      return '';
     }
 
     function statusClass(event) {
@@ -478,8 +580,10 @@ pub(crate) const INTERCEPTION_UI_HTML: &str = r#"<!doctype html>
       render();
       setStatus(state.paused ? 'paused' : 'live');
     });
+    controls.goblinMode.addEventListener('change', () => saveGoblinMode(controls.goblinMode.checked));
 
     loadRecent().then(connect).catch(error => setStatus('error: ' + error.message));
+    loadSettings().then(connectSettings).catch(error => setStatus('error: ' + error.message));
   </script>
 </body>
 </html>
@@ -510,6 +614,13 @@ pub(crate) struct UiEvent {
     pub truncated: bool,
     pub preview: Option<String>,
     pub preview_status: Option<String>,
+    pub goblin_mode_enabled: Option<bool>,
+    pub goblin_mode_applied: Option<bool>,
+    pub goblin_mode_outcome: Option<String>,
+    pub goblin_mode_reason: Option<String>,
+    pub goblin_rule_version: Option<String>,
+    pub request_id: Option<String>,
+    pub provider_response_id: Option<String>,
     pub summary: String,
     pub raw: Value,
 }
@@ -577,6 +688,23 @@ pub(crate) fn event_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+pub(crate) fn settings_stream(
+    receiver: watch::Receiver<RuntimeSettingsSnapshot>,
+) -> Sse<impl futures_core::Stream<Item = std::result::Result<Event, Infallible>>> {
+    let stream = stream::unfold((receiver, true), |(mut receiver, initial)| async move {
+        if !initial && receiver.changed().await.is_err() {
+            return None;
+        }
+        let snapshot = *receiver.borrow_and_update();
+        let data = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+        Some((
+            Ok(Event::default().event("settings").data(data)),
+            (receiver, false),
+        ))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 pub(crate) fn ui_event_from_line(line: &str) -> Result<Option<UiEvent>> {
     if line.trim().is_empty() {
         return Ok(None);
@@ -599,6 +727,18 @@ pub(crate) fn ui_event_from_record(record: EventRecord) -> UiEvent {
     let truncated = bool_field(data, "truncated").unwrap_or(false);
     let preview = string_field(data, "preview");
     let preview_status = string_field(data, "preview_status");
+    let goblin_mode_enabled = bool_field(data, "goblin_mode_enabled");
+    let explicit_goblin_mode_applied = bool_field(data, "goblin_mode_applied");
+    let goblin_mode_outcome = goblin_outcome_field(data);
+    let goblin_mode_applied = explicit_goblin_mode_applied.or_else(|| {
+        goblin_mode_outcome
+            .as_deref()
+            .map(|outcome| outcome == "applied")
+    });
+    let goblin_mode_reason = string_field(data, "goblin_mode_reason");
+    let goblin_rule_version = display_field(data, "goblin_rule_version");
+    let request_id = string_field(data, "request_id");
+    let provider_response_id = string_field(data, "provider_response_id");
     let category = category_for(&record.event_type).to_string();
     let summary = summary_text(
         &record.event_type,
@@ -632,6 +772,13 @@ pub(crate) fn ui_event_from_record(record: EventRecord) -> UiEvent {
         truncated,
         preview,
         preview_status,
+        goblin_mode_enabled,
+        goblin_mode_applied,
+        goblin_mode_outcome,
+        goblin_mode_reason,
+        goblin_rule_version,
+        request_id,
+        provider_response_id,
         summary,
         raw,
     }
@@ -807,6 +954,15 @@ fn display_field(data: &Value, key: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn goblin_outcome_field(data: &Value) -> Option<String> {
+    string_field(data, "goblin_mode_outcome").filter(|outcome| {
+        matches!(
+            outcome.as_str(),
+            "disabled" | "applied" | "skipped" | "failed"
+        )
+    })
+}
+
 fn u64_field(data: &Value, key: &str) -> Option<u64> {
     data.get(key).and_then(Value::as_u64)
 }
@@ -834,6 +990,20 @@ mod tests {
             event_type: event_type.to_string(),
             data,
         }
+    }
+
+    #[test]
+    fn goblin_controls_use_exact_status_and_accessibility_contracts() {
+        assert!(INTERCEPTION_UI_HTML.contains(
+            r#"id="status" class="status" role="status" aria-live="polite" aria-atomic="true""#
+        ));
+        assert!(INTERCEPTION_UI_HTML.contains(r#"aria-label="Goblin mode""#));
+        assert!(INTERCEPTION_UI_HTML
+            .contains("setExactStatus('Dance baby, dance! Goblins are back on the menu!')"));
+        assert!(INTERCEPTION_UI_HTML.contains("setExactStatus('Goblin mode disabled.')"));
+        assert!(INTERCEPTION_UI_HTML
+            .contains("setExactStatus('Goblin mode update failed: ' + error.message)"));
+        assert!(INTERCEPTION_UI_HTML.contains("if (goblin) parts.push(goblin)"));
     }
 
     #[test]
@@ -910,6 +1080,73 @@ mod tests {
             unavailable.raw["data"]["preview_error"],
             "deflate_decode_failed: corrupt deflate stream"
         );
+    }
+
+    #[test]
+    fn exposes_goblin_audit_fields_without_using_current_settings() {
+        let event = ui_event_from_record(record(
+            "codex_response_terminal",
+            json!({
+                "goblin_mode_enabled": true,
+                "goblin_mode_applied": true,
+                "goblin_mode_outcome": "applied",
+                "goblin_mode_reason": "exact_match",
+                "goblin_rule_version": 1,
+                "request_id": "marsala-42",
+                "provider_response_id": "resp_123"
+            }),
+        ));
+
+        assert_eq!(event.goblin_mode_enabled, Some(true));
+        assert_eq!(event.goblin_mode_applied, Some(true));
+        assert_eq!(event.goblin_mode_outcome.as_deref(), Some("applied"));
+        assert_eq!(event.goblin_mode_reason.as_deref(), Some("exact_match"));
+        assert_eq!(event.goblin_rule_version.as_deref(), Some("1"));
+        assert_eq!(event.request_id.as_deref(), Some("marsala-42"));
+        assert_eq!(event.provider_response_id.as_deref(), Some("resp_123"));
+    }
+
+    #[test]
+    fn maps_current_websocket_transform_audit_shape() {
+        let event = ui_event_from_record(record(
+            "mitm_websocket_transform",
+            json!({
+                "goblin_mode_enabled": true,
+                "goblin_mode_applied": true,
+                "goblin_mode_outcome": "applied",
+                "goblin_mode_reason": "target_removed",
+                "goblin_rule_version": 1,
+                "status": "transform_failed",
+                "reason": "deflate_decode_failed",
+                "request_id": "marsala-7"
+            }),
+        ));
+
+        assert_eq!(event.goblin_mode_applied, Some(true));
+        assert_eq!(event.goblin_mode_outcome.as_deref(), Some("applied"));
+        assert_eq!(event.goblin_mode_reason.as_deref(), Some("target_removed"));
+        assert_eq!(event.goblin_rule_version.as_deref(), Some("1"));
+        assert_eq!(event.status.as_deref(), Some("transform_failed"));
+    }
+
+    #[test]
+    fn ignores_generic_status_reason_for_goblin_display() {
+        let event = ui_event_from_record(record(
+            "mitm_websocket_transform",
+            json!({
+                "goblin_mode_enabled": true,
+                "status": "applied",
+                "reason": "target_removed",
+                "rule_version": 1
+            }),
+        ));
+
+        assert_eq!(event.goblin_mode_enabled, Some(true));
+        assert_eq!(event.goblin_mode_applied, None);
+        assert_eq!(event.goblin_mode_outcome, None);
+        assert_eq!(event.goblin_mode_reason, None);
+        assert_eq!(event.goblin_rule_version, None);
+        assert_eq!(event.status.as_deref(), Some("applied"));
     }
 
     #[test]
