@@ -2016,8 +2016,9 @@ impl WebSocketRequestProcessor {
             self.handle_frame(frame, runtime_settings, context, correlation, &mut output);
             let pending_bytes = self.pending.as_ref().map_or(0, |pending| pending.raw_bytes);
             if pending_bytes > MAX_WEBSOCKET_INSPECT_BUFFER_BYTES {
-                output.extend_from_slice(&self.finish());
                 self.passthrough = true;
+                output.extend_from_slice(&self.finish());
+                break;
             }
             if self.passthrough {
                 output.extend_from_slice(&self.finish());
@@ -2087,9 +2088,14 @@ impl WebSocketRequestProcessor {
                     }
                 }
             }
-            WebSocketOpcode::Close | WebSocketOpcode::Ping | WebSocketOpcode::Pong
-                if self.pending.is_some() =>
-            {
+            WebSocketOpcode::Close if self.pending.is_some() => {
+                if let Some(pending) = self.pending.take() {
+                    append_original_message(output, pending);
+                }
+                output.extend_from_slice(&frame.raw);
+                self.passthrough = true;
+            }
+            WebSocketOpcode::Ping | WebSocketOpcode::Pong if self.pending.is_some() => {
                 output.extend_from_slice(&frame.raw);
             }
             WebSocketOpcode::Binary if self.pending.is_none() => {
@@ -2184,12 +2190,10 @@ impl WebSocketRequestProcessor {
         let result = transform_response_create(&decoded, enabled);
 
         let forwarded_payload = if pending.compressed {
-            let source = if result.audit.status == TransformStatus::Applied {
-                result.bytes.as_slice()
-            } else {
-                decoded.as_slice()
-            };
-            match self.compress_message(source, context.compression.client_no_context_takeover) {
+            match self.compress_message(
+                &result.bytes,
+                context.compression.client_no_context_takeover,
+            ) {
                 Ok(compressed) => compressed,
                 Err(()) => {
                     emit_websocket_transport_audit_event(
@@ -5149,6 +5153,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goblin_mode_flushes_incomplete_fragment_before_close() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let original_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("one
+{target}
+two
+{target}
+three")
+        }))
+        .expect("request json");
+        let first = websocket_frame_with_fin_flags(
+            0x1,
+            false,
+            false,
+            &original_payload[..original_payload.len() / 2],
+            Some([0x10, 0x20, 0x30, 0x40]),
+        );
+        let close = websocket_frame(0x8, &[0x03, 0xe8], Some([1, 2, 3, 4]));
+        let original_frames = [first.as_slice(), close.as_slice()].concat();
+        let expected_frames = [first.as_slice(), close.as_slice()].concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101(expected_frames, Vec::new()).await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1
+host: localhost:{}
+connection: Upgrade
+upgrade: websocket
+sec-websocket-key: test-key
+sec-websocket-version: 13
+
+",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&original_frames)
+            .await
+            .expect("write incomplete fragmented message and close");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn goblin_mode_reencodes_with_permessage_deflate_context_takeover() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
@@ -5220,6 +5279,126 @@ mod tests {
         tls.write_all(
             format!(
                 "GET /backend-api/codex/responses HTTP/1.1\r\nhost: localhost:{}\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-key: test-key\r\nsec-websocket-version: 13\r\nsec-websocket-extensions: permessage-deflate\r\n\r\n",
+                upstream_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write websocket request");
+        let _ = read_http_response_head(&mut tls).await;
+        tls.write_all(&original_frames)
+            .await
+            .expect("write compressed messages");
+        let _ = tls.shutdown().await;
+
+        let _ = upstream_request_rx.await.expect("upstream request");
+        upstream_task.await.expect("upstream task");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goblin_mode_reencodes_decoded_fail_open_payload_with_context_takeover() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture = spawn_allowlisted_mitm_proxy_with_goblin_mode(&tempdir).await;
+        let target = crate::codex_transform::GOBLIN_MODE_TARGET;
+        let first_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("alpha
+{target}
+beta
+{target}
+gamma")
+        }))
+        .expect("first json");
+        let malformed_payload =
+            br#"{"type":"response.create","instructions":"unterminated"#.to_vec();
+        let second_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "response.create",
+            "instructions": format!("delta
+{target}
+epsilon
+{target}
+zeta")
+        }))
+        .expect("second json");
+        let first_transformed = transform_response_create(&first_payload, true).bytes;
+        let second_transformed = transform_response_create(&second_payload, true).bytes;
+
+        let mut client_compressor = Compress::new(Compression::fast(), false);
+        let first_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &first_payload);
+        let malformed_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &malformed_payload);
+        let second_compressed =
+            permessage_deflate_payload_with_compressor(&mut client_compressor, &second_payload);
+        let first_frame =
+            websocket_frame_with_rsv1(0x1, &first_compressed, Some([0x21, 0x32, 0x43, 0x54]));
+        let malformed_frame =
+            websocket_frame_with_rsv1(0x1, &malformed_compressed, Some([0x31, 0x42, 0x53, 0x64]));
+        let second_frame =
+            websocket_frame_with_rsv1(0x1, &second_compressed, Some([0x61, 0x72, 0x83, 0x94]));
+        let original_frames = [
+            first_frame.as_slice(),
+            malformed_frame.as_slice(),
+            second_frame.as_slice(),
+        ]
+        .concat();
+
+        let mut upstream_compressor = Compress::new(Compression::fast(), false);
+        let expected_first_compressed = permessage_deflate_payload_with_compressor(
+            &mut upstream_compressor,
+            &first_transformed,
+        );
+        let expected_malformed_compressed = permessage_deflate_payload_with_compressor(
+            &mut upstream_compressor,
+            &malformed_payload,
+        );
+        let expected_second_compressed = permessage_deflate_payload_with_compressor(
+            &mut upstream_compressor,
+            &second_transformed,
+        );
+        let expected_first = websocket_frame_with_rsv1(
+            0x1,
+            &expected_first_compressed,
+            Some([0x21, 0x32, 0x43, 0x54]),
+        );
+        let expected_malformed = websocket_frame_with_rsv1(
+            0x1,
+            &expected_malformed_compressed,
+            Some([0x31, 0x42, 0x53, 0x64]),
+        );
+        let expected_second = websocket_frame_with_rsv1(
+            0x1,
+            &expected_second_compressed,
+            Some([0x61, 0x72, 0x83, 0x94]),
+        );
+        let expected_frames = [
+            expected_first.as_slice(),
+            expected_malformed.as_slice(),
+            expected_second.as_slice(),
+        ]
+        .concat();
+        let (upstream_addr, upstream_request_rx, upstream_task) =
+            spawn_tls_websocket_upstream_101_with_response_headers(
+                expected_frames,
+                Vec::new(),
+                "sec-websocket-extensions: permessage-deflate
+",
+            )
+            .await;
+
+        let mut tls = connect_mitm_client(fixture.addr, upstream_addr, &fixture.ca_cert_path).await;
+        tls.write_all(
+            format!(
+                "GET /backend-api/codex/responses HTTP/1.1
+host: localhost:{}
+connection: Upgrade
+upgrade: websocket
+sec-websocket-key: test-key
+sec-websocket-version: 13
+sec-websocket-extensions: permessage-deflate
+
+",
                 upstream_addr.port()
             )
             .as_bytes(),
