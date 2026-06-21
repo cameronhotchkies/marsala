@@ -12,6 +12,27 @@ const SETTINGS_VERSION: u32 = 1;
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSettingsDirectorySyncStage {
+    None,
+    BackupEntry,
+    ReplacementCommit,
+    Rollback,
+}
+
+#[cfg(test)]
+impl RuntimeSettingsDirectorySyncStage {
+    fn mask(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::BackupEntry => 1 << 0,
+            Self::ReplacementCommit => 1 << 1,
+            Self::Rollback => 1 << 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeSettingsSnapshot {
     pub revision: u64,
@@ -69,7 +90,7 @@ struct RuntimeSettingsInner {
     state: Mutex<RuntimeSettingsState>,
     changes: watch::Sender<RuntimeSettingsSnapshot>,
     #[cfg(test)]
-    directory_sync_failures: AtomicU64,
+    directory_sync_failure_stage: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,7 +163,7 @@ impl RuntimeSettingsHandle {
                     }),
                     changes,
                     #[cfg(test)]
-                    directory_sync_failures: AtomicU64::new(0),
+                    directory_sync_failure_stage: AtomicU64::new(0),
                 }),
             },
             issue,
@@ -188,7 +209,7 @@ impl RuntimeSettingsHandle {
             &self.inner.path,
             next,
             #[cfg(test)]
-            &self.inner.directory_sync_failures,
+            &self.inner.directory_sync_failure_stage,
         )
         .await
         .map_err(RuntimeSettingsUpdateError::Persistence)?;
@@ -259,7 +280,7 @@ async fn load_snapshot(path: &Path) -> (RuntimeSettingsSnapshot, Option<RuntimeS
 async fn persist_snapshot(
     path: &Path,
     snapshot: RuntimeSettingsSnapshot,
-    #[cfg(test)] directory_sync_failures: &AtomicU64,
+    #[cfg(test)] directory_sync_failure_stage: &AtomicU64,
 ) -> Result<(), Error> {
     let parent = path
         .parent()
@@ -316,7 +337,9 @@ async fn persist_snapshot(
                 sync_parent_directory(
                     parent,
                     #[cfg(test)]
-                    directory_sync_failures,
+                    RuntimeSettingsDirectorySyncStage::BackupEntry,
+                    #[cfg(test)]
+                    directory_sync_failure_stage,
                 )
                 .await
                 .context("failed to sync runtime settings backup entry")?;
@@ -335,14 +358,20 @@ async fn persist_snapshot(
         if let Err(commit_error) = sync_parent_directory(
             parent,
             #[cfg(test)]
-            directory_sync_failures,
+            RuntimeSettingsDirectorySyncStage::ReplacementCommit,
+            #[cfg(test)]
+            directory_sync_failure_stage,
         )
         .await
         {
             let rollback_result = if had_previous {
-                tokio::fs::rename(cleanup.backup_path(), path)
+                let result = tokio::fs::rename(cleanup.backup_path(), path)
                     .await
-                    .context("failed to restore previous runtime settings file")
+                    .context("failed to restore previous runtime settings file");
+                if result.is_ok() {
+                    cleanup.mark_backup_consumed();
+                }
+                result
             } else {
                 tokio::fs::remove_file(path)
                     .await
@@ -350,19 +379,24 @@ async fn persist_snapshot(
             };
             if rollback_result.is_err() {
                 // The replacement remains the live atomic file. Treat it as
-                // committed so callers publish the same state that is on disk.
+                // committed so callers publish the same state that is on disk,
+                // and retire the no-longer-authoritative backup best-effort.
+                cleanup.cleanup_backup().await;
                 return Ok(());
             }
             sync_parent_directory(
                 parent,
                 #[cfg(test)]
-                directory_sync_failures,
+                RuntimeSettingsDirectorySyncStage::Rollback,
+                #[cfg(test)]
+                directory_sync_failure_stage,
             )
             .await
             .context("failed to sync runtime settings rollback")?;
             return Err(commit_error.context("failed to commit runtime settings replacement"));
         }
 
+        cleanup.cleanup_backup().await;
         Ok::<(), Error>(())
     }
     .await;
@@ -398,11 +432,20 @@ impl RuntimeSettingsPersistenceCleanup {
         self.backup_created = true;
     }
 
-    async fn cleanup(&self) {
-        let _ = tokio::fs::remove_file(&self.temp_path).await;
+    fn mark_backup_consumed(&mut self) {
+        self.backup_created = false;
+    }
+
+    async fn cleanup_backup(&mut self) {
         if self.backup_created {
             let _ = tokio::fs::remove_file(&self.backup_path).await;
+            self.backup_created = false;
         }
+    }
+
+    async fn cleanup(&mut self) {
+        let _ = tokio::fs::remove_file(&self.temp_path).await;
+        self.cleanup_backup().await;
     }
 }
 
@@ -435,18 +478,18 @@ fn backup_path(path: &Path) -> PathBuf {
 #[cfg(unix)]
 async fn sync_parent_directory(
     parent: Option<&Path>,
-    #[cfg(test)] directory_sync_failures: &AtomicU64,
+    #[cfg(test)] stage: RuntimeSettingsDirectorySyncStage,
+    #[cfg(test)] directory_sync_failure_stage: &AtomicU64,
 ) -> Result<(), Error> {
     #[cfg(test)]
-    if matches!(
-        directory_sync_failures.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-            remaining.checked_sub(1)
-        }),
-        Ok(1)
-    ) {
-        return Err(anyhow::anyhow!(
-            "injected runtime settings directory sync failure"
-        ));
+    {
+        let stage_mask = stage.mask();
+        if directory_sync_failure_stage.load(Ordering::Relaxed) & stage_mask != 0 {
+            directory_sync_failure_stage.fetch_and(!stage_mask, Ordering::Relaxed);
+            return Err(anyhow::anyhow!(
+                "injected runtime settings directory sync failure at {stage:?}"
+            ));
+        }
     }
     let parent = parent.unwrap_or_else(|| Path::new("."));
     let parent = parent.to_owned();
@@ -463,18 +506,18 @@ async fn sync_parent_directory(
 #[cfg(not(unix))]
 async fn sync_parent_directory(
     _parent: Option<&Path>,
-    #[cfg(test)] directory_sync_failures: &AtomicU64,
+    #[cfg(test)] stage: RuntimeSettingsDirectorySyncStage,
+    #[cfg(test)] directory_sync_failure_stage: &AtomicU64,
 ) -> Result<(), Error> {
     #[cfg(test)]
-    if matches!(
-        directory_sync_failures.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-            remaining.checked_sub(1)
-        }),
-        Ok(1)
-    ) {
-        return Err(anyhow::anyhow!(
-            "injected runtime settings directory sync failure"
-        ));
+    {
+        let stage_mask = stage.mask();
+        if directory_sync_failure_stage.load(Ordering::Relaxed) & stage_mask != 0 {
+            directory_sync_failure_stage.fetch_and(!stage_mask, Ordering::Relaxed);
+            return Err(anyhow::anyhow!(
+                "injected runtime settings directory sync failure at {stage:?}"
+            ));
+        }
     }
     Ok(())
 }
@@ -664,11 +707,10 @@ mod tests {
 
         // The first directory sync preserves the backup; the second confirms
         // the replacement and is the failure boundary under test.
-        loaded
-            .handle
-            .inner
-            .directory_sync_failures
-            .store(2, Ordering::Relaxed);
+        loaded.handle.inner.directory_sync_failure_stage.store(
+            RuntimeSettingsDirectorySyncStage::ReplacementCommit.mask(),
+            Ordering::Relaxed,
+        );
         let error = loaded
             .handle
             .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
@@ -696,11 +738,10 @@ mod tests {
         let path = tempdir.path().join("settings.json");
         let loaded = RuntimeSettingsHandle::load(&path).await;
 
-        loaded
-            .handle
-            .inner
-            .directory_sync_failures
-            .store(1, Ordering::Relaxed);
+        loaded.handle.inner.directory_sync_failure_stage.store(
+            RuntimeSettingsDirectorySyncStage::ReplacementCommit.mask(),
+            Ordering::Relaxed,
+        );
         let error = loaded
             .handle
             .update(0, RuntimeSettingsUpdate { goblin_mode: true })
@@ -726,11 +767,10 @@ mod tests {
             .expect("write corrupt settings");
         let loaded = RuntimeSettingsHandle::load(&path).await;
 
-        loaded
-            .handle
-            .inner
-            .directory_sync_failures
-            .store(2, Ordering::Relaxed);
+        loaded.handle.inner.directory_sync_failure_stage.store(
+            RuntimeSettingsDirectorySyncStage::ReplacementCommit.mask(),
+            Ordering::Relaxed,
+        );
         loaded
             .handle
             .update(0, RuntimeSettingsUpdate { goblin_mode: false })
@@ -755,6 +795,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_sync_failure_leaves_no_staging_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("settings.json");
+        let loaded = RuntimeSettingsHandle::load(&path).await;
+        let first = loaded
+            .handle
+            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .await
+            .expect("initial update");
+        let previous_bytes = tokio::fs::read(&path).await.expect("read initial settings");
+        let failure_mask = RuntimeSettingsDirectorySyncStage::ReplacementCommit.mask()
+            | RuntimeSettingsDirectorySyncStage::Rollback.mask();
+
+        loaded
+            .handle
+            .inner
+            .directory_sync_failure_stage
+            .store(failure_mask, Ordering::Relaxed);
+        let error = loaded
+            .handle
+            .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
+            .await
+            .expect_err("rollback sync failure must fail update");
+
+        assert_eq!(error.code(), "persistence_failed");
+        assert_eq!(loaded.handle.snapshot(), first);
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("read rolled back settings"),
+            previous_bytes
+        );
+        assert_no_runtime_settings_staging_files(tempdir.path()).await;
+    }
+
+    #[tokio::test]
     async fn backup_entry_sync_failure_removes_stale_backup() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let path = tempdir.path().join("settings.json");
@@ -766,11 +842,10 @@ mod tests {
             .expect("initial update");
         let previous_bytes = tokio::fs::read(&path).await.expect("read initial settings");
 
-        loaded
-            .handle
-            .inner
-            .directory_sync_failures
-            .store(1, Ordering::Relaxed);
+        loaded.handle.inner.directory_sync_failure_stage.store(
+            RuntimeSettingsDirectorySyncStage::BackupEntry.mask(),
+            Ordering::Relaxed,
+        );
         let error = loaded
             .handle
             .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
