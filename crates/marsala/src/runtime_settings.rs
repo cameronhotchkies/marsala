@@ -277,14 +277,14 @@ async fn persist_snapshot(
     };
     let bytes =
         serde_json::to_vec_pretty(&persisted).context("failed to serialize runtime settings")?;
-    let temp_path = temporary_path(path);
-    let backup_path = backup_path(path);
+    let mut cleanup =
+        RuntimeSettingsPersistenceCleanup::new(temporary_path(path), backup_path(path));
 
     let write_result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp_path)
+            .open(cleanup.temp_path())
             .await
             .context("failed to create temporary runtime settings file")?;
         file.write_all(&bytes)
@@ -301,11 +301,12 @@ async fn persist_snapshot(
             .context("failed to sync temporary runtime settings file")?;
         drop(file);
 
-        let had_previous = match tokio::fs::copy(path, &backup_path).await {
+        let had_previous = match tokio::fs::copy(path, cleanup.backup_path()).await {
             Ok(_) => {
+                cleanup.mark_backup_created();
                 let backup = tokio::fs::OpenOptions::new()
                     .read(true)
-                    .open(&backup_path)
+                    .open(cleanup.backup_path())
                     .await
                     .context("failed to open runtime settings backup")?;
                 backup
@@ -327,7 +328,7 @@ async fn persist_snapshot(
             }
         };
 
-        tokio::fs::rename(&temp_path, path)
+        tokio::fs::rename(cleanup.temp_path(), path)
             .await
             .context("failed to replace runtime settings file")?;
 
@@ -339,7 +340,7 @@ async fn persist_snapshot(
         .await
         {
             let rollback_result = if had_previous {
-                tokio::fs::rename(&backup_path, path)
+                tokio::fs::rename(cleanup.backup_path(), path)
                     .await
                     .context("failed to restore previous runtime settings file")
             } else {
@@ -362,17 +363,47 @@ async fn persist_snapshot(
             return Err(commit_error.context("failed to commit runtime settings replacement"));
         }
 
-        if had_previous {
-            let _ = tokio::fs::remove_file(&backup_path).await;
-        }
         Ok::<(), Error>(())
     }
     .await;
 
-    if write_result.is_err() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-    }
+    cleanup.cleanup().await;
     write_result
+}
+
+struct RuntimeSettingsPersistenceCleanup {
+    temp_path: PathBuf,
+    backup_path: PathBuf,
+    backup_created: bool,
+}
+
+impl RuntimeSettingsPersistenceCleanup {
+    fn new(temp_path: PathBuf, backup_path: PathBuf) -> Self {
+        Self {
+            temp_path,
+            backup_path,
+            backup_created: false,
+        }
+    }
+
+    fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    fn backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+
+    fn mark_backup_created(&mut self) {
+        self.backup_created = true;
+    }
+
+    async fn cleanup(&self) {
+        let _ = tokio::fs::remove_file(&self.temp_path).await;
+        if self.backup_created {
+            let _ = tokio::fs::remove_file(&self.backup_path).await;
+        }
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -721,6 +752,57 @@ mod tests {
             .expect("retry repair");
         assert_eq!(repaired.revision, 1);
         assert_eq!(RuntimeSettingsHandle::load(&path).await.issue, None);
+    }
+
+    #[tokio::test]
+    async fn backup_entry_sync_failure_removes_stale_backup() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("settings.json");
+        let loaded = RuntimeSettingsHandle::load(&path).await;
+        let first = loaded
+            .handle
+            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .await
+            .expect("initial update");
+        let previous_bytes = tokio::fs::read(&path).await.expect("read initial settings");
+
+        loaded
+            .handle
+            .inner
+            .directory_sync_failures
+            .store(1, Ordering::Relaxed);
+        let error = loaded
+            .handle
+            .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
+            .await
+            .expect_err("backup entry sync failure must fail update");
+
+        assert_eq!(error.code(), "persistence_failed");
+        assert_eq!(loaded.handle.snapshot(), first);
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("read preserved settings"),
+            previous_bytes
+        );
+        assert_no_runtime_settings_staging_files(tempdir.path()).await;
+    }
+
+    async fn assert_no_runtime_settings_staging_files(directory: &Path) {
+        let mut entries = tokio::fs::read_dir(directory)
+            .await
+            .expect("read settings directory");
+        let mut staging_files = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("read settings entry") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".backup") || name.ends_with(".tmp") {
+                staging_files.push(name);
+            }
+        }
+        assert!(
+            staging_files.is_empty(),
+            "unexpected runtime settings staging files: {staging_files:?}"
+        );
     }
 
     #[tokio::test]
