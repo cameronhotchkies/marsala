@@ -125,7 +125,7 @@ async fn update_ui_settings(
         return settings_error_response(
             StatusCode::FORBIDDEN,
             "invalid_origin",
-            "runtime settings updates require a same-origin browser request",
+            "runtime settings updates require an Origin header matching the Host header",
             state
                 .runtime_settings
                 .as_ref()

@@ -729,26 +729,14 @@ pub(crate) fn ui_event_from_record(record: EventRecord) -> UiEvent {
     let preview_status = string_field(data, "preview_status");
     let goblin_mode_enabled = bool_field(data, "goblin_mode_enabled");
     let explicit_goblin_mode_applied = bool_field(data, "goblin_mode_applied");
-    let has_goblin_audit = goblin_mode_enabled.is_some()
-        || explicit_goblin_mode_applied.is_some()
-        || data.get("goblin_mode_outcome").is_some();
-    let goblin_mode_outcome = string_field(data, "goblin_mode_outcome").or_else(|| {
-        has_goblin_audit
-            .then(|| string_field(data, "outcome").or_else(|| string_field(data, "status")))
-            .flatten()
-    });
+    let goblin_mode_outcome = goblin_outcome_field(data);
     let goblin_mode_applied = explicit_goblin_mode_applied.or_else(|| {
         goblin_mode_outcome
             .as_deref()
             .map(|outcome| outcome == "applied")
     });
-    let goblin_mode_reason = string_field(data, "goblin_mode_reason").or_else(|| {
-        goblin_mode_outcome
-            .as_ref()
-            .and_then(|_| string_field(data, "reason"))
-    });
-    let goblin_rule_version =
-        display_field(data, "goblin_rule_version").or_else(|| display_field(data, "rule_version"));
+    let goblin_mode_reason = string_field(data, "goblin_mode_reason");
+    let goblin_rule_version = display_field(data, "goblin_rule_version");
     let request_id = string_field(data, "request_id");
     let provider_response_id = string_field(data, "provider_response_id");
     let category = category_for(&record.event_type).to_string();
@@ -966,6 +954,15 @@ fn display_field(data: &Value, key: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn goblin_outcome_field(data: &Value) -> Option<String> {
+    string_field(data, "goblin_mode_outcome").filter(|outcome| {
+        matches!(
+            outcome.as_str(),
+            "disabled" | "applied" | "skipped" | "failed"
+        )
+    })
+}
+
 fn u64_field(data: &Value, key: &str) -> Option<u64> {
     data.get(key).and_then(Value::as_u64)
 }
@@ -1115,8 +1112,12 @@ mod tests {
             "mitm_websocket_transform",
             json!({
                 "goblin_mode_enabled": true,
-                "status": "applied",
-                "reason": "target_removed",
+                "goblin_mode_applied": true,
+                "goblin_mode_outcome": "applied",
+                "goblin_mode_reason": "target_removed",
+                "goblin_rule_version": 1,
+                "status": "transform_failed",
+                "reason": "deflate_decode_failed",
                 "request_id": "marsala-7"
             }),
         ));
@@ -1124,6 +1125,28 @@ mod tests {
         assert_eq!(event.goblin_mode_applied, Some(true));
         assert_eq!(event.goblin_mode_outcome.as_deref(), Some("applied"));
         assert_eq!(event.goblin_mode_reason.as_deref(), Some("target_removed"));
+        assert_eq!(event.goblin_rule_version.as_deref(), Some("1"));
+        assert_eq!(event.status.as_deref(), Some("transform_failed"));
+    }
+
+    #[test]
+    fn ignores_generic_status_reason_for_goblin_display() {
+        let event = ui_event_from_record(record(
+            "mitm_websocket_transform",
+            json!({
+                "goblin_mode_enabled": true,
+                "status": "applied",
+                "reason": "target_removed",
+                "rule_version": 1
+            }),
+        ));
+
+        assert_eq!(event.goblin_mode_enabled, Some(true));
+        assert_eq!(event.goblin_mode_applied, None);
+        assert_eq!(event.goblin_mode_outcome, None);
+        assert_eq!(event.goblin_mode_reason, None);
+        assert_eq!(event.goblin_rule_version, None);
+        assert_eq!(event.status.as_deref(), Some("applied"));
     }
 
     #[test]
