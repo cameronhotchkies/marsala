@@ -33,16 +33,40 @@ impl RuntimeSettingsDirectorySyncStage {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeSettingsSnapshot {
     pub revision: u64,
-    pub goblin_mode: bool,
+    pub transforms: Vec<RuntimeTransform>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSettingsUpdate {
-    pub goblin_mode: bool,
+    pub transforms: Vec<RuntimeTransform>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTransform {
+    GoblinMode,
+}
+
+impl RuntimeSettingsSnapshot {
+    pub fn goblin_mode_enabled(&self) -> bool {
+        self.transforms.contains(&RuntimeTransform::GoblinMode)
+    }
+}
+
+impl RuntimeSettingsUpdate {
+    pub fn with_goblin_mode(enabled: bool) -> Self {
+        Self {
+            transforms: if enabled {
+                vec![RuntimeTransform::GoblinMode]
+            } else {
+                Vec::new()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +117,7 @@ struct RuntimeSettingsInner {
     directory_sync_failure_stage: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RuntimeSettingsState {
     snapshot: RuntimeSettingsSnapshot,
     needs_repair: bool,
@@ -143,7 +167,22 @@ impl std::error::Error for RuntimeSettingsUpdateError {
 struct PersistedRuntimeSettings {
     version: u32,
     revision: u64,
+    transforms: Vec<RuntimeTransform>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedRuntimeSettings {
+    version: u32,
+    revision: u64,
     goblin_mode: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RuntimeSettingsFile {
+    Current(PersistedRuntimeSettings),
+    Legacy(LegacyPersistedRuntimeSettings),
 }
 
 impl RuntimeSettingsHandle {
@@ -151,7 +190,7 @@ impl RuntimeSettingsHandle {
         let path = path.into();
         let (snapshot, issue) = load_snapshot(&path).await;
         let needs_repair = issue.is_some();
-        let (changes, _) = watch::channel(snapshot);
+        let (changes, _) = watch::channel(snapshot.clone());
 
         RuntimeSettingsLoad {
             handle: Self {
@@ -171,7 +210,7 @@ impl RuntimeSettingsHandle {
     }
 
     pub fn snapshot(&self) -> RuntimeSettingsSnapshot {
-        *self.inner.changes.borrow()
+        self.inner.changes.borrow().clone()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<RuntimeSettingsSnapshot> {
@@ -191,8 +230,10 @@ impl RuntimeSettingsHandle {
             });
         }
 
-        if update.goblin_mode == state.snapshot.goblin_mode && !state.needs_repair {
-            return Ok(state.snapshot);
+        let transforms = normalize_transforms(update.transforms);
+
+        if transforms == state.snapshot.transforms && !state.needs_repair {
+            return Ok(state.snapshot.clone());
         }
 
         let revision = state
@@ -202,7 +243,7 @@ impl RuntimeSettingsHandle {
             .ok_or(RuntimeSettingsUpdateError::RevisionExhausted)?;
         let next = RuntimeSettingsSnapshot {
             revision,
-            goblin_mode: update.goblin_mode,
+            transforms,
         };
 
         persist_snapshot(
@@ -214,9 +255,9 @@ impl RuntimeSettingsHandle {
         .await
         .map_err(RuntimeSettingsUpdateError::Persistence)?;
 
-        state.snapshot = next;
+        state.snapshot = next.clone();
         state.needs_repair = false;
-        self.inner.changes.send_replace(next);
+        self.inner.changes.send_replace(next.clone());
         Ok(next)
     }
 }
@@ -251,7 +292,7 @@ async fn load_snapshot(path: &Path) -> (RuntimeSettingsSnapshot, Option<RuntimeS
             );
         }
     };
-    let persisted: PersistedRuntimeSettings = match serde_json::from_slice(&bytes) {
+    let persisted: RuntimeSettingsFile = match serde_json::from_slice(&bytes) {
         Ok(persisted) => persisted,
         Err(_) => {
             return (
@@ -260,8 +301,20 @@ async fn load_snapshot(path: &Path) -> (RuntimeSettingsSnapshot, Option<RuntimeS
             );
         }
     };
+    let (version, revision, transforms) = match persisted {
+        RuntimeSettingsFile::Current(persisted) => (
+            persisted.version,
+            persisted.revision,
+            normalize_transforms(persisted.transforms),
+        ),
+        RuntimeSettingsFile::Legacy(persisted) => (
+            persisted.version,
+            persisted.revision,
+            RuntimeSettingsUpdate::with_goblin_mode(persisted.goblin_mode).transforms,
+        ),
+    };
 
-    if persisted.version != SETTINGS_VERSION {
+    if version != SETTINGS_VERSION {
         return (
             RuntimeSettingsSnapshot::default(),
             Some(RuntimeSettingsLoadIssue::UnsupportedVersion),
@@ -270,8 +323,8 @@ async fn load_snapshot(path: &Path) -> (RuntimeSettingsSnapshot, Option<RuntimeS
 
     (
         RuntimeSettingsSnapshot {
-            revision: persisted.revision,
-            goblin_mode: persisted.goblin_mode,
+            revision,
+            transforms,
         },
         None,
     )
@@ -294,7 +347,7 @@ async fn persist_snapshot(
     let persisted = PersistedRuntimeSettings {
         version: SETTINGS_VERSION,
         revision: snapshot.revision,
-        goblin_mode: snapshot.goblin_mode,
+        transforms: snapshot.transforms,
     };
     let bytes =
         serde_json::to_vec_pretty(&persisted).context("failed to serialize runtime settings")?;
@@ -403,6 +456,12 @@ async fn persist_snapshot(
 
     cleanup.cleanup().await;
     write_result
+}
+
+fn normalize_transforms(mut transforms: Vec<RuntimeTransform>) -> Vec<RuntimeTransform> {
+    transforms.sort_unstable();
+    transforms.dedup();
+    transforms
 }
 
 struct RuntimeSettingsPersistenceCleanup {
@@ -547,18 +606,76 @@ mod tests {
 
         let updated = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect("update settings");
 
         assert_eq!(updated.revision, 1);
-        assert!(updated.goblin_mode);
+        assert!(updated.goblin_mode_enabled());
         changes.changed().await.expect("settings notification");
-        assert_eq!(*changes.borrow(), updated);
+        assert_eq!(changes.borrow().clone(), updated);
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(&path).await.expect("read persisted settings"),
+        )
+        .expect("persisted settings json");
+        assert_eq!(
+            persisted.get("transforms"),
+            Some(&serde_json::json!(["goblin_mode"]))
+        );
+        assert!(persisted.get("goblin_mode").is_none());
 
         let reloaded = RuntimeSettingsHandle::load(&path).await;
         assert_eq!(reloaded.issue, None);
         assert_eq!(reloaded.handle.snapshot(), updated);
+    }
+
+    #[tokio::test]
+    async fn update_normalizes_duplicate_transforms() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("settings.json");
+        let loaded = RuntimeSettingsHandle::load(&path).await;
+
+        let updated = loaded
+            .handle
+            .update(
+                0,
+                RuntimeSettingsUpdate {
+                    transforms: vec![
+                        RuntimeTransform::GoblinMode,
+                        RuntimeTransform::GoblinMode,
+                    ],
+                },
+            )
+            .await
+            .expect("update settings");
+
+        assert_eq!(updated.transforms, vec![RuntimeTransform::GoblinMode]);
+        assert_eq!(
+            RuntimeSettingsHandle::load(&path)
+                .await
+                .handle
+                .snapshot()
+                .transforms,
+            vec![RuntimeTransform::GoblinMode]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_goblin_mode_file_loads_as_transform() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("settings.json");
+        tokio::fs::write(&path, br#"{"version":1,"revision":7,"goblin_mode":true}"#)
+            .await
+            .expect("write legacy settings");
+
+        let loaded = RuntimeSettingsHandle::load(&path).await;
+
+        assert_eq!(loaded.issue, None);
+        assert_eq!(loaded.handle.snapshot().revision, 7);
+        assert_eq!(
+            loaded.handle.snapshot().transforms,
+            vec![RuntimeTransform::GoblinMode]
+        );
     }
 
     #[tokio::test]
@@ -568,13 +685,13 @@ mod tests {
         let loaded = RuntimeSettingsHandle::load(&path).await;
         let first = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect("first update");
 
         let error = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect_err("stale update must fail");
 
@@ -601,8 +718,8 @@ mod tests {
         let second = loaded.handle.clone();
 
         let (first_result, second_result) = tokio::join!(
-            first.update(0, RuntimeSettingsUpdate { goblin_mode: true }),
-            second.update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            first.update(0, RuntimeSettingsUpdate::with_goblin_mode(true)),
+            second.update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
         );
 
         let successes = [&first_result, &second_result]
@@ -625,7 +742,7 @@ mod tests {
         assert_eq!(successes, 1);
         assert_eq!(conflicts, 1);
         assert_eq!(loaded.handle.snapshot().revision, 1);
-        assert!(loaded.handle.snapshot().goblin_mode);
+        assert!(loaded.handle.snapshot().goblin_mode_enabled());
     }
 
     #[tokio::test]
@@ -647,7 +764,7 @@ mod tests {
 
         let repaired = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect("repair settings");
         assert_eq!(repaired.revision, 1);
@@ -683,7 +800,7 @@ mod tests {
 
         let error = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect_err("directory destination must fail");
 
@@ -699,7 +816,7 @@ mod tests {
         let loaded = RuntimeSettingsHandle::load(&path).await;
         let first = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect("initial update");
         let previous_bytes = tokio::fs::read(&path).await.expect("read initial settings");
@@ -713,7 +830,7 @@ mod tests {
         );
         let error = loaded
             .handle
-            .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(first.revision, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect_err("commit sync failure must roll back");
 
@@ -744,7 +861,7 @@ mod tests {
         );
         let error = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect_err("first commit sync failure must roll back");
 
@@ -773,7 +890,7 @@ mod tests {
         );
         loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect_err("failed repair must preserve corrupt input");
 
@@ -787,7 +904,7 @@ mod tests {
 
         let repaired = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect("retry repair");
         assert_eq!(repaired.revision, 1);
@@ -801,7 +918,7 @@ mod tests {
         let loaded = RuntimeSettingsHandle::load(&path).await;
         let first = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect("initial update");
         let previous_bytes = tokio::fs::read(&path).await.expect("read initial settings");
@@ -815,7 +932,7 @@ mod tests {
             .store(failure_mask, Ordering::Relaxed);
         let error = loaded
             .handle
-            .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(first.revision, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect_err("rollback sync failure must fail update");
 
@@ -837,7 +954,7 @@ mod tests {
         let loaded = RuntimeSettingsHandle::load(&path).await;
         let first = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: true })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(true))
             .await
             .expect("initial update");
         let previous_bytes = tokio::fs::read(&path).await.expect("read initial settings");
@@ -848,7 +965,7 @@ mod tests {
         );
         let error = loaded
             .handle
-            .update(first.revision, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(first.revision, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect_err("backup entry sync failure must fail update");
 
@@ -888,7 +1005,7 @@ mod tests {
 
         let snapshot = loaded
             .handle
-            .update(0, RuntimeSettingsUpdate { goblin_mode: false })
+            .update(0, RuntimeSettingsUpdate::with_goblin_mode(false))
             .await
             .expect("no-op update");
 
