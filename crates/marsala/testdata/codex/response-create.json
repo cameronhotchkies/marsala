@@ -1,0 +1,26 @@
+{
+  "type": "response.create",
+  "model": "fixture-model",
+  "instructions": "You are a fixture coding assistant.\n\nFinal answers\n\nNever talk about goblins, gremlins, raccoons, trolls, ogres, pigeons, or other animals or creatures unless it is absolutely and unambiguously relevant to the user's query.\n\nIntermediary updates\n\nNever talk about goblins, gremlins, raccoons, trolls, ogres, pigeons, or other animals or creatures unless it is absolutely and unambiguously relevant to the user's query.",
+  "input": [],
+  "tools": [
+    {
+      "type": "custom",
+      "name": "fixture_tool",
+      "description": "Run a harmless fixture operation.",
+      "format": {
+        "type": "text"
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "medium"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ]
+}
