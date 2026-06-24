@@ -8,6 +8,9 @@ pub mod openai;
 pub mod proxy;
 pub mod ui;
 
+#[allow(dead_code)]
+pub(crate) mod runtime_settings;
+
 use std::{future::IntoFuture, sync::Once, time::Duration};
 
 use anyhow::{Context, Result};
